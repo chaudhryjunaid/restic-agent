@@ -19,6 +19,7 @@ resticagent status             # what ran, how it went, what runs next
 - **One timer per job.** A single systemd template unit serves every job, and each job's schedule lives in its own small drop-in file.
 - **Retention that stays in its lane.** Every snapshot is tagged `job:<name>`, so old snapshots are forgotten per job, even when several jobs share a repository.
 - **Monitoring built in.** `status` shows the last result and next run of every job and exits non-zero after a failure. `logs` opens the journal of a job or of its latest run.
+- **Notifications.** Desktop notifications say when a scheduled backup starts (🔄), succeeds (✅) or fails (❌). A failure also mails the local account the job belongs to: yours, or root's for system-wide jobs.
 - **Run on demand.** `start` runs a job through systemd right now and streams its log, without ever overlapping a scheduled run.
 - **Snapshots per job.** `snapshots` lists a job's snapshots, and `show` shows what is in one with `ls -alh` or `tree`. `forget` deletes its oldest ones, or all but its newest, and lists exactly which ones go before asking.
 - **Restore with a preview.** `restore` puts files back in place or into another folder. It shows first what it would overwrite or delete, and asks.
@@ -128,6 +129,7 @@ Things to know about your own jobs:
 | `run JOB` | Run a job directly in the terminal, outside systemd |
 | `status [JOB]` | Show timer state, last run, result and next run |
 | `logs [JOB]` | Show the journal of all jobs or one job |
+| `notify [JOB] --test` | Send a test failure alert. A failed run sends a real one through systemd. |
 | `snapshots JOB` | List a job's snapshots |
 | `show JOB [SNAPSHOT] [PATH]` | Show the files in a snapshot with `ls -alh`, or with `tree` given `--tree` |
 | `restore JOB [SNAPSHOT] [PATH]` | Restore files in place, or below `--target DIR`, after previewing the changes |
@@ -159,11 +161,12 @@ Configuration lives on each host, here for your own jobs. System-wide jobs use t
 ~/.config/systemd/user/
 ├── restic-backup@.service                  template service, runs "resticagent run <job>"
 ├── restic-backup@.timer                    template timer
+├── restic-backup-notify@.service           template failure alert, runs "resticagent notify <job>"
 └── restic-backup@home.timer.d/
     └── schedule.conf                       the schedule of job "home"
 ```
 
-When a job's timer fires, systemd starts `restic-backup@home.service`. That runs `resticagent run home`, which reads the global settings and then the job's own settings, runs `restic backup` on the job's paths, and applies its retention rules with `restic forget`.
+When a job's timer fires, systemd starts `restic-backup@home.service`. That runs `resticagent run home`, which reads the global settings and then the job's own settings, runs `restic backup` on the job's paths, and applies its retention rules with `restic forget`. If the run fails, systemd starts `restic-backup-notify@home.service`, which sends the alerts.
 
 ## Safety notes
 

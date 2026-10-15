@@ -1,0 +1,10 @@
+# Template service: the failure alert of one job, e.g. restic-backup-notify@home.service.
+# Installed by "resticagent install". restic-backup@<job>.service starts it
+# through OnFailure= when a run fails, and it shows a desktop notification
+# and mails the local account, as set up with "resticagent init".
+[Unit]
+Description=Failure alert for restic backup job %i
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/resticagent notify %i

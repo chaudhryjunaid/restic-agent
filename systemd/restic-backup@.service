@@ -11,12 +11,15 @@ Wants=network-online.target
 After=network-online.target
 # Skip silently if the job has been removed but the timer is still around.
 ConditionPathExists=/etc/resticagent/config.d/%i/env
+# A failed run starts the job's alert: a desktop notification and local mail.
+OnFailure=restic-backup-notify@%i.service
 
 [Service]
 Type=oneshot
 # The script loads /etc/resticagent/config and config.d/%i/env itself, so a
-# manual "resticagent run %i" behaves exactly like a timer run.
-ExecStart=/usr/local/bin/resticagent run %i
+# manual "resticagent run %i" behaves like a timer run. --notify adds desktop
+# notices when the run starts and succeeds.
+ExecStart=/usr/local/bin/resticagent run %i --notify
 # Backups are I/O heavy; keep them out of the way of interactive work.
 Nice=10
 IOSchedulingClass=best-effort

@@ -5,7 +5,7 @@ This guide covers every command, the configuration files, restoring data and tro
 - [Concepts](#concepts)
 - [Setting up](#setting-up): `init`, `add`, `import`, `install`
 - [Running backups](#running-backups): schedules, `start`, `run`
-- [Monitoring](#monitoring): `status`, `logs`, `list`
+- [Monitoring](#monitoring): notifications with `notify`, `status`, `logs`, `list`
 - [Changing a job](#changing-a-job)
 - [Snapshots](#snapshots): `snapshots`, `show`, `forget`
 - [Removing jobs](#removing-jobs): `remove`
@@ -35,13 +35,15 @@ Creates or updates the global settings. `add` runs it automatically the first ti
 | Default password file | `~/.config/resticagent/password`, or `/etc/resticagent/password` for system-wide jobs | `RESTIC_PASSWORD_FILE` |
 | restic cache directory | `~/.cache/restic`, or `/var/cache/restic` for system-wide jobs | `RESTIC_CACHE_DIR` |
 | Compression (`auto`, `off`, `max`) | `auto` | `RESTIC_COMPRESSION` |
+| Desktop notifications: `all` (start, success, failure), `failures` or `off` | `all` | `NOTIFY_DESKTOP` |
+| Mail failure alerts to the local account | yes | `NOTIFY_MAIL` |
 | Additional environment variables | none | one `KEY=VALUE` per line |
 
 The repository can be any location restic supports, for example `/mnt/backup/restic`, `sftp:backup@nas.local:/srv/restic`, `s3:s3.amazonaws.com/my-bucket/restic` or `rest:https://backup.example.com/`.
 
 Use the additional variables for backend credentials and other restic settings, for example `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `B2_ACCOUNT_ID`, `B2_ACCOUNT_KEY` or `RESTIC_PACK_SIZE`. `list` shows only their names, never their values.
 
-If the password file does not exist, `init` offers to create it. It asks for the password twice without echoing it and saves the file with mode 0600.
+If the password file does not exist, `init` offers to create it. It asks for the password twice without echoing it and saves the file with mode 0600. With alerts on, `init` offers to send a test alert at the end.
 
 ### `resticagent add [JOB]`
 
@@ -205,9 +207,9 @@ resticagent start home --no-wait
 
 The units must be installed first. A configured job without a timer can still be started by hand.
 
-### `resticagent run JOB`
+### `resticagent run JOB [--notify]`
 
-Runs a job directly in your terminal, outside systemd. The service uses this command itself, so a manual `run` does exactly what a scheduled run does. Prefer `start` for manual runs, because a `run` does not appear in `status` or `logs` and is not protected against overlapping a scheduled run.
+Runs a job directly in your terminal, outside systemd. The service uses this command itself, so a manual `run` does what a scheduled run does. The service adds `--notify`, for the desktop notifications when the run starts and succeeds. Prefer `start` for manual runs, because a `run` does not appear in `status` or `logs` and is not protected against overlapping a scheduled run.
 
 What a run does:
 
@@ -218,6 +220,31 @@ What a run does:
 Both restic commands wait up to 30 minutes for a repository lock, so jobs that share a repository take turns instead of failing.
 
 ## Monitoring
+
+### Notifications and failure alerts
+
+Runs of the systemd service, from the timer or from `start`, show desktop notifications. Each title starts with an icon:
+
+| Icon | When | How it shows |
+| --- | --- | --- |
+| 🔄 | a backup starts, naming its paths | passes, without piling up in the notification list |
+| ✅ | a backup succeeds, with how long it took | passes, without piling up |
+| ⚠️ | a backup saved a snapshot, but could not read some files (exit 3) | stays in the list |
+| ❌ | a backup fails, with the last line of its log | critical: stays on screen until dismissed |
+
+`NOTIFY_DESKTOP` chooses which ones you get: `all` (the default), `failures` for only ⚠️ and ❌, or `off`. A `run` in a terminal shows none. The service runs `run JOB --notify` for the start and success notices. For system-wide jobs, every user logged in at a seat gets them.
+
+You hear about a failure without checking `status`. Each job's service has `OnFailure=restic-backup-notify@<job>.service`. systemd starts that unit after any failed run, also when the run crashed or was killed, and it runs `resticagent notify <job>`, which sends:
+
+- **The ⚠️ or ❌ desktop notification,** unless `NOTIFY_DESKTOP` is `off`.
+- **Mail to a local account,** unless `NOTIFY_MAIL` is `0`. Your own jobs mail your account, and system-wide jobs mail `root`. No other address can be set. The mail holds the last 15 lines of the run's log and the commands to look into it. It goes through this machine's `sendmail`, so it needs a mail transfer agent such as Postfix or msmtp, and without one no mail is sent. Read it with `mail`, or forward it in `/etc/aliases` (root) or `~/.forward` (your account).
+
+```sh
+resticagent notify --test        # a test alert with the global settings
+resticagent notify home --test   # with job "home"'s settings, if it overrides them
+```
+
+Choose the notifications with `init`, or with these keys in an `import` file. A job's own `env` file can override them, for example to keep an hourly job to `failures`. After an update, run `install` once, so the jobs' units get the `OnFailure=` line and `--notify`.
 
 ### `resticagent status [JOB]`
 
@@ -459,6 +486,8 @@ All files are plain text. Values are written as `KEY='VALUE'`, one per line, and
 | `RESTIC_PASSWORD_FILE` | The file holding the repository password |
 | `RESTIC_CACHE_DIR` | restic's local cache |
 | `RESTIC_COMPRESSION` | `auto`, `off` or `max` |
+| `NOTIFY_DESKTOP` | Desktop notifications: `all` (start, success and failure, the default), `failures` or `off` |
+| `NOTIFY_MAIL` | `0` turns mail about failed runs off. It is on by default, and goes to your account, or to root for system-wide jobs. |
 | any other key | Passed to restic as an environment variable, for example backend credentials |
 
 ### `~/.config/resticagent/config.d/<job>/env`

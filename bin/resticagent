@@ -37,10 +37,14 @@ VERSION="0.7.0"
 ROOT="${RESTICAGENT_ROOT:-}"
 ROOT=${ROOT%/}
 UNIT_PREFIX="restic-backup@"
+# The unit templates in ../systemd: a job's backup, its timer and its failure alert
+TEMPLATES=("${UNIT_PREFIX}.service" "${UNIT_PREFIX}.timer" "restic-backup-notify@.service")
 # restic 0.17 added the exit codes (10 = no repository, 12 = wrong password)
 # that install relies on, and --retry-lock (0.16) is used by run.
 MIN_RESTIC_MINOR=17
 KEEP_RULES=(last hourly daily weekly monthly yearly within)
+# Failure alert settings, kept in the global settings; a job's env may override them.
+NOTIFY_KEYS=(NOTIFY_DESKTOP NOTIFY_MAIL)
 # The keys of a job's env file that "add" asks about, besides the repository
 # and password file overrides, in the order they are written.
 JOB_KEYS=(ON_CALENDAR RANDOMIZED_DELAY KEEP_LAST KEEP_HOURLY KEEP_DAILY KEEP_WEEKLY
@@ -257,6 +261,10 @@ validate_restic_duration_or_empty() {
   [[ -z "$1" || "$1" =~ ^([0-9]+[ymdh])+$ ]] || { warn "use restic durations such as 30d, 2m or 1y6m, or leave empty"; return 1; }
 }
 
+validate_desktop_mode() {
+  [[ "$1" =~ ^(all|failures|off)$ ]] || { warn "choose all, failures or off"; return 1; }
+}
+
 validate_compression() {
   [[ "$1" =~ ^(auto|off|max)$ ]] || { warn "choose auto, off or max"; return 1; }
 }
@@ -432,7 +440,7 @@ write_global_config() {
   local -a extra=() names=()
   for key in "${!_wg[@]}"; do
     case $key in
-      RESTIC_REPOSITORY|RESTIC_PASSWORD_FILE|RESTIC_CACHE_DIR|RESTIC_COMPRESSION) ;;
+      RESTIC_REPOSITORY|RESTIC_PASSWORD_FILE|RESTIC_CACHE_DIR|RESTIC_COMPRESSION|NOTIFY_*) ;;
       *) names+=("$key") ;;
     esac
   done
@@ -441,7 +449,7 @@ write_global_config() {
   write_file "$GLOBAL_CONFIG" 0600 < <(
     printf '# resticagent global settings. Change them with "%s init" or "%s import --global".\n' "$PROG" "$PROG"
     printf '# Read by "%s run" before each job'"'"'s own env file.\n' "$PROG"
-    for key in RESTIC_REPOSITORY RESTIC_PASSWORD_FILE RESTIC_CACHE_DIR RESTIC_COMPRESSION "${extra[@]}"; do
+    for key in RESTIC_REPOSITORY RESTIC_PASSWORD_FILE RESTIC_CACHE_DIR RESTIC_COMPRESSION "${NOTIFY_KEYS[@]}" "${extra[@]}"; do
       env_line "$key" "${_wg[$key]:-}"
     done
   )
@@ -632,11 +640,11 @@ cmd_init() {
   require_root init
   load_env "$GLOBAL_CONFIG"
 
-  local repo pwfile cache compression key kv
+  local repo pwfile cache compression key kv desktop mail
   local -a extras=()
   for key in "${!CUR[@]}"; do
     case $key in
-      RESTIC_REPOSITORY|RESTIC_PASSWORD_FILE|RESTIC_CACHE_DIR|RESTIC_COMPRESSION) ;;
+      RESTIC_REPOSITORY|RESTIC_PASSWORD_FILE|RESTIC_CACHE_DIR|RESTIC_COMPRESSION|NOTIFY_*) ;;
       *) extras+=("$key=${CUR[$key]}") ;;
     esac
   done
@@ -651,6 +659,16 @@ cmd_init() {
   ask cache       "restic cache directory" "${CUR[RESTIC_CACHE_DIR]:-$DEFAULT_CACHE_DIR}" validate_abs_path
   ask compression "Compression (auto, off, max)" "${CUR[RESTIC_COMPRESSION]:-auto}" validate_compression
 
+  header "Failure alerts"
+  note "Desktop notifications can tell you when a scheduled backup starts, succeeds and fails."
+  note "When one fails, resticagent can also mail the local '$(mail_recipient)' account."
+  ask desktop "Desktop notifications: all (start, success, failure), failures, or off" \
+    "$(desktop_mode "${CUR[NOTIFY_DESKTOP]:-}")" validate_desktop_mode
+  if ask_yesno "Mail failure alerts to the local '$(mail_recipient)' account?" "$(yn_default "${CUR[NOTIFY_MAIL]:-1}")"; then mail=1; else mail=0; fi
+  if (( mail )) && ! sendmail_path >/dev/null; then
+    warn "this machine has no sendmail, so no mail goes out until a mail transfer agent such as postfix or msmtp-mta is installed"
+  fi
+
   header "Additional environment variables"
   ask_list extras "Backend credentials and other restic settings, as KEY=VALUE (optional)." \
     "Examples: AWS_ACCESS_KEY_ID=..., AWS_SECRET_ACCESS_KEY=..., B2_ACCOUNT_ID=..., RESTIC_PACK_SIZE=64" \
@@ -660,12 +678,16 @@ cmd_init() {
   local -A settings=(
     [RESTIC_REPOSITORY]=$repo [RESTIC_PASSWORD_FILE]=$pwfile
     [RESTIC_CACHE_DIR]=$cache [RESTIC_COMPRESSION]=$compression
+    [NOTIFY_DESKTOP]=$desktop [NOTIFY_MAIL]=$mail
   )
   # settings is passed by name to write_global_config.
   # shellcheck disable=SC2034
   for kv in "${extras[@]}"; do settings[${kv%%=*}]=${kv#*=}; done
   write_global_config settings
   ensure_password_file "$pwfile"
+  if [[ "$desktop" != off ]] || (( mail )); then
+    if ask_yesno "Send a test alert now?" y; then cmd_notify --test || true; fi
+  fi
 }
 
 # ---------------------------------------------------------------------------
@@ -950,6 +972,25 @@ cmd_import() {
     || import_check RESTIC_CACHE_DIR "${MASTER[RESTIC_CACHE_DIR]}" validate_abs_path "use an absolute path" || bad=1
   [[ -z "${MASTER[RESTIC_COMPRESSION]:-}" ]] \
     || import_check RESTIC_COMPRESSION "${MASTER[RESTIC_COMPRESSION]}" validate_compression "use auto, off or max" || bad=1
+  if [[ -n "${MASTER[NOTIFY_DESKTOP]:-}" ]]; then
+    value=${MASTER[NOTIFY_DESKTOP],,}
+    if [[ "$value" =~ ^(all|failures|off)$ ]]; then
+      MASTER[NOTIFY_DESKTOP]=$value
+    elif value=$(normalize_bool "$value"); then
+      MASTER[NOTIFY_DESKTOP]=$(desktop_mode "$value")
+    else
+      warn "NOTIFY_DESKTOP: use all, failures or off"
+      bad=1
+    fi
+  fi
+  if [[ -n "${MASTER[NOTIFY_MAIL]:-}" ]]; then
+    if value=$(normalize_bool "${MASTER[NOTIFY_MAIL]}"); then
+      MASTER[NOTIFY_MAIL]=$value
+    else
+      warn "NOTIFY_MAIL: use 1 or 0 (yes, no, true and false work too)"
+      bad=1
+    fi
+  fi
 
   if (( ${#src[@]} == 0 )); then
     warn "SRC: list at least one path to back up, separated by commas"
@@ -1187,7 +1228,7 @@ install_program() {
   write_file "$BIN_PATH" 0755 <"$SELF"
   # The unit templates go along, so the installed copy can install units too.
   src=$(template_dir) || return 0
-  for unit in "${UNIT_PREFIX}.service" "${UNIT_PREFIX}.timer"; do
+  for unit in "${TEMPLATES[@]}"; do
     write_file "$SHARE_DIR/systemd/$unit" 0644 <"$src/$unit"
   done
 }
@@ -1195,12 +1236,13 @@ install_program() {
 # template_dir -> the directory with the unit templates that came with this
 # program: ../systemd in a checkout, ../share/resticagent/systemd when installed
 template_dir() {
-  local dir
+  local dir unit
   for dir in "${SELF%/*}/../systemd" "${SELF%/*}/../share/resticagent/systemd"; do
-    if [[ -f "$dir/${UNIT_PREFIX}.service" && -f "$dir/${UNIT_PREFIX}.timer" ]]; then
-      readlink -f "$dir"
-      return 0
-    fi
+    for unit in "${TEMPLATES[@]}"; do
+      [[ -f "$dir/$unit" ]] || continue 2
+    done
+    readlink -f "$dir"
+    return 0
   done
   return 1
 }
@@ -1222,7 +1264,7 @@ render_template() {
 install_templates() {
   local src_dir unit
   if src_dir=$(template_dir); then
-    for unit in "${UNIT_PREFIX}.service" "${UNIT_PREFIX}.timer"; do
+    for unit in "${TEMPLATES[@]}"; do
       write_file "$SYSTEMD_DIR/$unit" 0644 < <(render_template "$src_dir/$unit")
     done
   elif [[ -f "$SYSTEMD_DIR/${UNIT_PREFIX}.service" && -f "$SYSTEMD_DIR/${UNIT_PREFIX}.timer" ]]; then
@@ -1470,8 +1512,16 @@ cmd_start() {
 # run: one backup plus retention; this is what the systemd service executes
 # ---------------------------------------------------------------------------
 cmd_run() {
-  local job=${1:-} rule key rc=0
-  [[ -n "$job" ]] || die "usage: $PROG run JOB"
+  local job='' notify=0 arg rule key rc=0 started=$SECONDS
+  local -a src=()
+  for arg in "$@"; do
+    case $arg in
+      --notify) notify=1 ;;
+      -*)       die "unknown option '$arg' (see '$PROG help')" ;;
+      *)        [[ -z "$job" ]] || die "run takes a single job"; job=$arg ;;
+    esac
+  done
+  [[ -n "$job" ]] || die "usage: $PROG run JOB [--notify]"
   validate_job_name "$job" || die "invalid job name '$job'"
   require_root run "$@"
   local dir="$JOBS_DIR/$job"
@@ -1479,6 +1529,9 @@ cmd_run() {
   require_restic
   load_job_env "$job"
   export_job_env
+  # The service asks for start and success notices with --notify; a failure
+  # is told by its OnFailure= unit instead, even when this run is killed.
+  if [[ "$(desktop_mode "${JENV[NOTIFY_DESKTOP]:-}")" != all ]]; then notify=0; fi
 
   # Every snapshot carries job:<name>, so forget only ever touches this job's
   # snapshots, even when several jobs share one repository.
@@ -1496,6 +1549,15 @@ cmd_run() {
   done
   [[ "${JENV[PRUNE]:-0}" == 1 ]] && forget+=(--prune)
 
+  if (( notify )); then
+    load_lines src "$dir/src"
+    if (( ${#src[@]} > 1 )); then
+      run_notice start "Backup '$job' started" "Backing up ${src[0]} and $(( ${#src[@]} - 1 )) more"
+    else
+      run_notice start "Backup '$job' started" "Backing up ${src[0]:-}"
+    fi
+  fi
+
   info "==> backup of job '$job' to ${JENV[RESTIC_REPOSITORY]:-?}"
   restic "${backup[@]}" || rc=$?
   case $rc in
@@ -1506,16 +1568,230 @@ cmd_run() {
 
   if (( ${#keep[@]} == 0 )); then
     warn "no KEEP_* rules for job '$job', retention not applied"
-    return "$rc"
+  else
+    info "==> retention for job '$job': ${keep[*]}"
+    local forget_rc=0
+    restic "${forget[@]}" "${keep[@]}" || forget_rc=$?
+    if (( forget_rc != 0 )); then
+      printf 'error: forget failed (restic exit %d)\n' "$forget_rc" >&2
+      return "$forget_rc"
+    fi
   fi
-  info "==> retention for job '$job': ${keep[*]}"
-  local forget_rc=0
-  restic "${forget[@]}" "${keep[@]}" || forget_rc=$?
-  if (( forget_rc != 0 )); then
-    printf 'error: forget failed (restic exit %d)\n' "$forget_rc" >&2
-    return "$forget_rc"
+  # Exit 3 ends as a failed unit, whose alert says the backup is incomplete.
+  if (( notify && rc == 0 )); then
+    run_notice success "Backup '$job' finished" "Done in $(elapsed $(( SECONDS - started )))"
   fi
   return "$rc"
+}
+
+# ---------------------------------------------------------------------------
+# notify: tell the user that a backup failed, on the desktop and by local mail
+# ---------------------------------------------------------------------------
+
+# sendmail_path -> the sendmail of this machine's mail transfer agent, if any
+sendmail_path() {
+  local path
+  path=$(command -v sendmail 2>/dev/null) || path=/usr/sbin/sendmail
+  [[ -x "$path" ]] && printf '%s\n' "$path"
+}
+
+# mail_recipient -> the local account that gets failure mail: root for the
+# system-wide jobs, else the user running this, whose jobs they are
+mail_recipient() {
+  if [[ "$SCOPE" == system ]]; then echo root; else id -un; fi
+}
+
+# desktop_mode VALUE -> the NOTIFY_DESKTOP setting VALUE as all (start, success
+# and failure), failures or off. Unset means all; 1 and 0 mean all and off.
+desktop_mode() {
+  case ${1:-all} in
+    off|0|no|false) echo off ;;
+    failures)       echo failures ;;
+    *)              echo all ;;
+  esac
+}
+
+# elapsed SECONDS -> a duration such as 45s, 2m 13s or 1h 05m
+elapsed() {
+  if (( $1 < 60 )); then printf '%ds' "$1"
+  elif (( $1 < 3600 )); then printf '%dm %02ds' $(( $1 / 60 )) $(( $1 % 60 ))
+  else printf '%dh %02dm' $(( $1 / 3600 )) $(( $1 % 3600 / 60 ))
+  fi
+}
+
+# alerts_summary -> the failure alerts that CUR (a settings file) sets up
+alerts_summary() {
+  local -a parts=()
+  if [[ "$(desktop_mode "${CUR[NOTIFY_DESKTOP]:-}")" != off ]]; then parts+=("desktop ($(desktop_mode "${CUR[NOTIFY_DESKTOP]:-}"))"); fi
+  if [[ "${CUR[NOTIFY_MAIL]:-1}" != 0 ]]; then parts+=("mail to $(mail_recipient)"); fi
+  if (( ${#parts[@]} == 0 )); then parts=(none); fi
+  join_by ', ' "${parts[@]}"
+}
+
+# markup_escape TEXT -> TEXT safe in a notification body, which may hold markup
+markup_escape() {
+  local s=${1//&/&amp;}
+  s=${s//</&lt;}
+  printf '%s' "${s//>/&gt;}"
+}
+
+# alert_desktop KIND SUMMARY BODY -> a desktop notification through the session
+# bus of the user running this, or as root through the bus of every user
+# logged in at a seat. KIND (start, success, test, incomplete or failure) sets
+# the emoji its title starts with, and how insistent it is: a failure stays
+# until dismissed, while start and success notices pass without piling up in
+# the notification list. Returns 2 when there is nobody to notify.
+alert_desktop() {
+  local kind=$1 summary body icon=dialog-information urgency=1 user rc=2
+  local -a hints call
+  case $kind in
+    start)      summary="🔄 $2" ;;
+    success)    summary="✅ $2" ;;
+    test)       summary="🔔 $2" ;;
+    incomplete) summary="⚠️ $2" icon=dialog-warning ;;
+    *)          summary="❌ $2" icon=dialog-error urgency=2 ;;
+  esac
+  if [[ "$kind" == start || "$kind" == success ]]; then
+    hints=(2 urgency y "$urgency" transient b true)
+  else
+    hints=(1 urgency y "$urgency")
+  fi
+  body=$(markup_escape "$3")
+  # "--" keeps busctl from reading the timeout -1 (the server's default) as an option.
+  call=(-- call org.freedesktop.Notifications /org/freedesktop/Notifications org.freedesktop.Notifications
+        Notify 'susssasa{sv}i' resticagent 0 "$icon" "$summary" "$body" 0 "${hints[@]}" -1)
+  if [[ "$SCOPE" == user ]]; then
+    busctl --user "${call[@]}" >/dev/null
+    return
+  fi
+  # System-wide jobs have no desktop of their own.
+  while read -r user; do
+    if busctl --machine="$user@.host" --user "${call[@]}" >/dev/null; then rc=0; elif (( rc == 2 )); then rc=1; fi
+  done < <(loginctl list-sessions --no-legend 2>/dev/null | awk '$4 != "" && $4 != "-" { print $3 }' | sort -u)
+  return "$rc"
+}
+
+# run_notice KIND SUMMARY BODY -> a start or success notice of run. It never
+# fails the backup, and only speaks up when it could not be shown.
+run_notice() {
+  local rc=0
+  alert_desktop "$@" || rc=$?
+  if (( rc == 1 )); then note "  could not show a desktop notification"; fi
+  return 0
+}
+
+# alert_mail SUBJECT BODY -> mails the local account from mail_recipient
+# through this machine's sendmail. Its mail transfer agent delivers it to the
+# local mailbox, or wherever /etc/aliases or ~/.forward send that account's
+# mail. Returns 2 when there is no sendmail.
+alert_mail() {
+  local to sendmail
+  sendmail=$(sendmail_path) || return 2
+  to=$(mail_recipient)
+  printf 'From: resticagent <%s>\nTo: %s\nSubject: %s\nDate: %s\nMIME-Version: 1.0\nContent-Type: text/plain; charset=utf-8\nContent-Transfer-Encoding: 8bit\n\n%s\n' \
+    "$to" "$to" "$1" "$(date -R)" "$2" | "$sendmail" -t -i
+}
+
+cmd_notify() {
+  local job='' test=0 arg host when unit result status inv lines='' prev='' tries last summary body desk mail kind of_job='' sent=0 broken=0 rc
+  for arg in "$@"; do
+    case $arg in
+      --test) test=1 ;;
+      -*)     die "unknown option '$arg' (see '$PROG help')" ;;
+      *)      [[ -z "$job" ]] || die "notify takes a single job"; job=$arg ;;
+    esac
+  done
+  if (( ! test )) && [[ -z "$job" ]]; then die "usage: $PROG notify JOB, or $PROG notify [JOB] --test"; fi
+  if [[ -n "$job" ]]; then validate_job_name "$job" || die "invalid job name '$job'"; fi
+  require_root notify "$@"
+  JENV=()
+  if [[ -n "$job" ]]; then
+    [[ -f "$JOBS_DIR/$job/env" ]] || die "job '$job' is not configured. Run: $SUDO$PROG add $job"
+    load_job_env "$job"
+  else
+    read_env JENV "$GLOBAL_CONFIG"
+  fi
+  host=$(hostname)
+  when=$(date '+%Y-%m-%d %H:%M %Z')
+  if [[ -n "$job" ]]; then of_job=" of job '$job'"; fi
+
+  if (( test )); then
+    kind='test'
+    summary="Test alert from resticagent on $host"
+    body="When a backup$of_job fails, resticagent tells you like this."
+    desk=$body
+    mail="$body
+
+The mail about a real failure also holds the last lines of the backup's log."
+  else
+    # systemd 251 and newer describe the failed run to OnFailure= units;
+    # otherwise its unit still has the details.
+    unit=${MONITOR_UNIT:-$(service_unit "$job")}
+    result=${MONITOR_SERVICE_RESULT:-$(sctl show -P Result "$unit" 2>/dev/null || true)}
+    status=${MONITOR_EXIT_STATUS:-$(sctl show -P ExecMainStatus "$unit" 2>/dev/null || true)}
+    inv=${MONITOR_INVOCATION_ID:-$(sctl show -P InvocationID "$unit" 2>/dev/null || true)}
+    if [[ -n "$inv" ]]; then
+      # systemd starts this right as the run fails, and journald may store the
+      # run's last lines a moment later: read until they stop changing.
+      for (( tries = 0; tries < 20; tries++ )); do
+        lines=$(journalctl "_SYSTEMD_INVOCATION_ID=$inv" -o cat --no-pager -n 15 2>/dev/null || true)
+        if [[ -n "$lines" && "$lines" == "$prev" ]]; then break; fi
+        prev=$lines
+        sleep 0.25
+      done
+    fi
+    last=$(grep -v '^[[:space:]]*$' <<<"$lines" | tail -n 1 || true)
+    if [[ "$result" == exit-code && "$status" == 3 ]]; then
+      kind=incomplete
+      summary="Backup '$job' on $host is incomplete"
+      body="Some files could not be read (restic exit 3), so the snapshot of $when lacks them."
+    else
+      kind=failure
+      summary="Backup '$job' on $host failed"
+      case $result in
+        exit-code) body="The backup failed at $when (exit $status)." ;;
+        ''|success) body="The backup failed at $when." ;;
+        *)         body="The backup failed at $when: $result${status:+ ($status)}." ;;
+      esac
+    fi
+    desk="$body${last:+
+$last}
+See: $SUDO$PROG logs $job --last"
+    mail="$body"
+    if [[ -n "$lines" ]]; then
+      mail+="
+
+The last lines of its log:
+
+    ${lines//$'\n'/$'\n'    }"
+    fi
+    mail+="
+
+See the whole run:  $SUDO$PROG logs $job --last
+Run it again:       $SUDO$PROG start $job
+All jobs:           $SUDO$PROG status"
+  fi
+
+  if [[ "$(desktop_mode "${JENV[NOTIFY_DESKTOP]:-}")" != off ]]; then
+    rc=0
+    alert_desktop "$kind" "$summary" "$desk" || rc=$?
+    case $rc in
+      0) ok "sent       a desktop notification"; sent=1 ;;
+      2) note "  no one is logged in at a seat, so there is no desktop to notify" ;;
+      *) warn "could not show a desktop notification: no desktop session could be reached"; broken=1 ;;
+    esac
+  fi
+  if [[ "${JENV[NOTIFY_MAIL]:-1}" != 0 ]]; then
+    rc=0
+    alert_mail "[resticagent] $summary" "$mail" || rc=$?
+    case $rc in
+      0) ok "sent       mail to the local '$(mail_recipient)' account"; sent=1 ;;
+      2) note "  this machine has no sendmail, so no mail was sent" ;;
+      *) warn "could not mail the local '$(mail_recipient)' account"; broken=1 ;;
+    esac
+  fi
+  if (( ! sent && ! broken )); then note "No failure alerts are set up. Set them up with: $SUDO$PROG init"; fi
+  return "$broken"
 }
 
 # ---------------------------------------------------------------------------
@@ -2256,9 +2532,10 @@ cmd_list() {
     row "Password file" "$(describe_file "${CUR[RESTIC_PASSWORD_FILE]:-}")"
     row "Cache"         "${CUR[RESTIC_CACHE_DIR]:--}"
     row "Compression"   "${CUR[RESTIC_COMPRESSION]:--}"
+    row "Failure alerts" "$(alerts_summary)"
     for key in "${!CUR[@]}"; do
       case $key in
-        RESTIC_REPOSITORY|RESTIC_PASSWORD_FILE|RESTIC_CACHE_DIR|RESTIC_COMPRESSION) ;;
+        RESTIC_REPOSITORY|RESTIC_PASSWORD_FILE|RESTIC_CACHE_DIR|RESTIC_COMPRESSION|NOTIFY_*) ;;
         *) others+=("$key") ;;
       esac
     done
@@ -2546,14 +2823,16 @@ cmd_remove() {
       rm -rf -- "${JOBS_DIR:?}/${job:?}"
       ok "deleted    $JOBS_DIR/$job"
     fi
-    run_systemctl reset-failed "$(service_unit "$job")" "$unit" >/dev/null 2>&1 || true
+    run_systemctl reset-failed "$(service_unit "$job")" "$unit" "restic-backup-notify@$job.service" >/dev/null 2>&1 || true
   done
 
   if (( all )); then
-    for file in "$SYSTEMD_DIR/${UNIT_PREFIX}.service" "$SYSTEMD_DIR/${UNIT_PREFIX}.timer"; do
+    for unit in "${TEMPLATES[@]}"; do
+      file="$SYSTEMD_DIR/$unit"
       if [[ -e "$file" ]]; then rm -f -- "$file"; ok "deleted    $file"; ANY_CHANGED=1; fi
     done
-    for file in "$SHARE_DIR/systemd/${UNIT_PREFIX}.service" "$SHARE_DIR/systemd/${UNIT_PREFIX}.timer"; do
+    for unit in "${TEMPLATES[@]}"; do
+      file="$SHARE_DIR/systemd/$unit"
       if [[ -e "$file" ]]; then rm -f -- "$file"; ok "deleted    $file"; fi
     done
     rmdir "$SHARE_DIR/systemd" "$SHARE_DIR" 2>/dev/null || true
@@ -2620,6 +2899,12 @@ Monitoring:
                       The journal of every job, or of one job, opened at the
                       newest line. --last shows only the most recent run of JOB.
                       Other options go to journalctl, e.g. -f or --since today.
+  notify JOB          Alert about JOB's last run, which failed: a desktop
+                      notification, and mail to root (system-wide jobs) or to
+                      your own account. A failed run starts this through systemd.
+                      NOTIFY_DESKTOP=all (default) also shows starts and
+                      successes, failures only those, off none.
+  notify [JOB] --test Send a test alert, to check how alerts are set up.
 
 Running a job now:
   start JOB [--no-wait]
@@ -2627,8 +2912,9 @@ Running a job now:
                       show its log until it finishes. The run appears in status
                       and logs, and never overlaps another run of JOB. Ctrl-C
                       stops following, not the backup. --no-wait returns at once.
-  run JOB             Run JOB directly in this terminal, outside systemd. The
-                      systemd service uses this command itself.
+  run JOB [--notify]  Run JOB directly in this terminal, outside systemd. The
+                      systemd service uses this command itself, with --notify
+                      for desktop notices when the run starts and succeeds.
 
 Snapshots:
   snapshots JOB [restic snapshots options]
@@ -2689,6 +2975,7 @@ main() {
     logs|log)          cmd_logs "$@" ;;
     start)             cmd_start "$@" ;;
     run)               cmd_run "$@" ;;
+    notify)            cmd_notify "$@" ;;
     snapshots)         cmd_snapshots "$@" ;;
     show)              cmd_show "$@" ;;
     restore)           cmd_restore "$@" ;;

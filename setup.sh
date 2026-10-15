@@ -278,7 +278,8 @@ do_install() {
 
   header "resticagent $VERSION"
   install_program
-  INSTALLED+=(bin/resticagent "share/resticagent/systemd/${UNIT_PREFIX}.service" "share/resticagent/systemd/${UNIT_PREFIX}.timer")
+  INSTALLED+=(bin/resticagent)
+  for f in "${TEMPLATES[@]}"; do INSTALLED+=("share/resticagent/systemd/$f"); done
   for doc in README.md USAGE.md LICENSE; do put "share/doc/resticagent/$doc" 0644 "$REPO/$doc"; done
 
   INSTALLED+=(share/resticagent/manifest)
