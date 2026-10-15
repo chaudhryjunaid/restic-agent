@@ -1,0 +1,7 @@
+# Encrypted with git-crypt. Unlock a clone with:
+#   git-crypt unlock /path/to/github.git-crypt.key
+# Any .env file, and everything under hosts/, holds host settings and secrets.
+*.env filter=git-crypt diff=git-crypt
+hosts/** filter=git-crypt diff=git-crypt
+# This file must stay readable, so git-crypt knows what to encrypt.
+.gitattributes !filter !diff
