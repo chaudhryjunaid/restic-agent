@@ -9,7 +9,7 @@ This guide covers every command, the configuration files, restoring data and tro
 - [Changing a job](#changing-a-job)
 - [Snapshots](#snapshots): `snapshots`, `show`, `forget`
 - [Removing jobs](#removing-jobs): `remove`
-- [Restoring files](#restoring-files)
+- [Restoring files](#restoring-files): `restore`
 - [File reference](#file-reference)
 - [Exit codes](#exit-codes)
 - [Troubleshooting](#troubleshooting)
@@ -382,7 +382,52 @@ A backup that is running when you remove its job is allowed to finish. Snapshots
 
 ## Restoring files
 
-resticagent schedules and runs backups. For restores, use restic directly with the job's settings loaded:
+### `resticagent restore JOB [SNAPSHOT] [PATH] [--target DIR] [--overwrite MODE] [--delete] [--dry-run] [-y]`
+
+Puts files from a snapshot back. Without options it restores the job's latest snapshot in place, over the live files, after showing what would change and asking.
+
+```sh
+resticagent restore home --dry-run                              # what restoring in place would change
+resticagent restore home /home/me/Documents                     # one folder, in place
+resticagent restore home 3f988623 /home/me/notes.txt            # one file, from snapshot 3f988623
+resticagent restore home /home/me/Documents --target /tmp/r     # to /tmp/r/home/me/Documents
+resticagent restore home /home/me/Documents --overwrite never   # only bring back missing files
+resticagent restore home /home/me/Documents --delete            # make the folder exactly as in the snapshot
+```
+
+```text
+Snapshot 3f988623 of job 'home', made 2026-10-15 02:00 on laptop
+Files that differ from the snapshot are overwritten.
+
+/home/me/Documents, in place:
+  2 new                files restored
+  1 overwritten        files replaced by the snapshot's version
+  140 untouched        files that match the snapshot or are kept
+    Overwritten:
+      /home/me/Documents/budget.ods
+
+Proceed? [y/N]:
+```
+
+What happens to the files already at the destination:
+
+| `--overwrite` | A file that differs from the snapshot | A missing file | A file the snapshot does not have |
+| --- | --- | --- | --- |
+| `always` (default) | replaced | restored | kept |
+| `if-changed` | replaced. Files with the same size and time count as unchanged, which is faster. | restored | kept |
+| `if-newer` | replaced, unless it is newer than the snapshot | restored | kept |
+| `never` | kept | restored | kept |
+| any of these, with `--delete` | as above | restored | **deleted** |
+
+- **It shows the plan first.** restic's dry run counts the new, overwritten, deleted and untouched files, and lists the overwritten and deleted ones, up to 20 of each. `--dry-run` stops there and lists every change. `-y` skips the question.
+- **SNAPSHOT and PATH work as in `show`.** SNAPSHOT is an ID or a unique beginning of one, and the latest snapshot by default. Another job's snapshot is refused. PATH is a folder or a file as it was on the backed-up machine. Without it, every path the snapshot backed up is restored.
+- **`--target DIR` restores elsewhere,** keeping the full original paths: `/home/me/Documents` goes to `DIR/home/me/Documents`. A relative DIR starts from the current directory.
+- **`--delete` stays inside the restored folders.** Each folder is restored on its own, with itself as the target, so nothing outside it is deleted, not even files right next to it. Backed-up single files are restored without `--delete`, and naming a file as PATH together with `--delete` is refused.
+- **Restore a system-wide job with sudo,** as root, so files get their owners back.
+
+### Using restic directly
+
+For anything `restore` does not cover, use restic with the job's settings loaded:
 
 ```sh
 set -a
@@ -396,7 +441,7 @@ restic restore latest --tag job:home --target /tmp/restore
 restic restore latest --tag job:home --target /tmp/restore --include /home/me/Documents
 ```
 
-`resticagent snapshots home` shows the same list as the `restic snapshots` line, without loading anything, and `resticagent show home` replaces `restic ls`, to find the paths for `--include`. `set -a` exports every variable the files define, so restic finds the repository, the password file and any credentials. Restore into a separate directory first, then copy back what you need. For a system-wide job, start with `sudo -i` and load the files in `/etc/resticagent` instead.
+`resticagent snapshots home` shows the same list as the `restic snapshots` line, without loading anything, and `resticagent show home` replaces `restic ls`. `set -a` exports every variable the files define, so restic finds the repository, the password file and any credentials. For a system-wide job, start with `sudo -i` and load the files in `/etc/resticagent` instead.
 
 To browse snapshots like a folder, use `restic mount /mnt/restic`. This needs FUSE.
 
@@ -465,7 +510,7 @@ One restic exclude pattern per line, passed to `restic backup --exclude-file`. L
 
 If the backup fails, retention is skipped. If the backup succeeds but `restic forget` fails, `run` returns the code from `forget`.
 
-`forget` returns the exit code of `restic forget` when that fails, for example 11 when the lock could not be taken.
+`forget` and `restore` return restic's exit code when restic fails, for example 11 when the lock could not be taken.
 
 `status` returns 1 when any job's last run failed or was partial, and 0 otherwise. `logs` returns the exit code of `journalctl`. The other commands return 0 on success and 1 on an error.
 

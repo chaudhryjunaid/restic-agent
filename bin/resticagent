@@ -1618,6 +1618,60 @@ tree_input() {
   '
 }
 
+# check_snapshot_arg JOB SNAPSHOT -> dies unless SNAPSHOT is an ID or "latest"
+check_snapshot_arg() {
+  [[ "$2" == latest || "$2" =~ ^[0-9a-f]{1,64}$ ]] \
+    || die "'$2' is not a snapshot. Use an ID from '$SUDO$PROG snapshots $1', or latest"
+}
+
+# resolve_snapshot JOB SNAPSHOT [PATH] -> finds SNAPSHOT (an ID or latest) of
+# JOB and prints its header. Sets SNAP_ID, and SNAP_ROOTS to PATH or else to
+# the paths the snapshot backed up. restic ignores --tag for an explicit ID,
+# so the job tag is checked here, and another job's snapshot is refused.
+# Returns restic's exit code, or 1, after saying what went wrong.
+SNAP_ID='' SNAP_ROOTS=()
+resolve_snapshot() {
+  local job=$1 snap=$2 path=${3:-} json errfile time host tag found=0 rc=0
+  local -a tags=()
+  errfile=$(mktemp)
+  if [[ "$snap" == latest ]]; then
+    json=$(restic snapshots --no-lock --json --tag "job:$job" latest 2>"$errfile") || rc=$?
+  else
+    json=$(restic snapshots --no-lock --json "$snap" 2>"$errfile") || rc=$?
+  fi
+  SNAP_ID=$(json_strings id <<<"$json")
+  if (( rc != 0 )) || [[ -z "$SNAP_ID" ]]; then
+    if (( rc != 0 )); then
+      printf "%serror:%s could not read the snapshots of job '%s' (restic exit %d)\n" "$C_RED" "$C_RESET" "$job" "$rc" >&2
+    elif [[ "$snap" == latest ]]; then
+      printf "%serror:%s job '%s' has no snapshots yet. Make one with: %s\n" "$C_RED" "$C_RESET" "$job" "$SUDO$PROG start $job" >&2
+      rc=1
+    else
+      printf "%serror:%s no snapshot matches '%s'. See the snapshots of job '%s' with: %s\n" "$C_RED" "$C_RESET" "$snap" "$job" "$SUDO$PROG snapshots $job" >&2
+      rc=1
+    fi
+    sed 's/^/  /' "$errfile" >&2
+    rm -f "$errfile"
+    return "$rc"
+  fi
+  rm -f "$errfile"
+  mapfile -t tags < <(json_strings tags <<<"$json")
+  for tag in "${tags[@]}"; do
+    if [[ "$tag" == "job:$job" ]]; then found=1; fi
+  done
+  (( found )) || die "snapshot ${SNAP_ID:0:8} was not made by job '$job'. See its snapshots with: $SUDO$PROG snapshots $job"
+
+  if [[ -n "$path" ]]; then
+    while [[ "$path" == */ && "$path" != / ]]; do path=${path%/}; done
+    SNAP_ROOTS=("$path")
+  else
+    mapfile -t SNAP_ROOTS < <(json_strings paths <<<"$json")
+  fi
+  time=$(json_strings time <<<"$json")
+  host=$(json_strings hostname <<<"$json")
+  header "Snapshot ${SNAP_ID:0:8} of job '$job', made ${time:0:10} ${time:11:5} on $host"
+}
+
 # The temporary FUSE mount that show runs ls in, and the restic process behind it
 SHOW_MNT='' SHOW_PID='' SHOW_LOG=''
 
@@ -1659,8 +1713,8 @@ show_unmount() {
 }
 
 cmd_show() {
-  local job='' snap='' path='' mode=list arg json errfile id time host tag found=0 out input base entries dir r shown=0 rc=0
-  local -a roots=() tags=() missing=() tree_args=()
+  local job='' snap='' path='' mode=list arg id out input base entries dir r shown=0 rc=0
+  local -a roots=() missing=() tree_args=()
   for arg in "$@"; do
     case $arg in
       --tree) mode=tree ;;
@@ -1676,8 +1730,7 @@ cmd_show() {
   [[ -n "$job" ]] || die "usage: $PROG show JOB [SNAPSHOT] [PATH] [--tree]  (see '$PROG help')"
   validate_job_name "$job" || die "invalid job name '$job'"
   snap=${snap:-latest}
-  [[ "$snap" == latest || "$snap" =~ ^[0-9a-f]{1,64}$ ]] \
-    || die "'$snap' is not a snapshot. Use an ID from '$SUDO$PROG snapshots $job', or latest"
+  check_snapshot_arg "$job" "$snap"
   require_root show "$@"
   [[ -f "$JOBS_DIR/$job/env" ]] || die "job '$job' is not configured. Run: $SUDO$PROG add $job"
   if [[ "$mode" == tree ]]; then
@@ -1689,46 +1742,9 @@ cmd_show() {
   require_restic
   load_job_env "$job"
   export_job_env
-
-  # Resolve the snapshot first. restic ignores --tag for an explicit ID, so
-  # the job tag is checked here, and another job's snapshot is refused.
-  errfile=$(mktemp)
-  if [[ "$snap" == latest ]]; then
-    json=$(restic snapshots --no-lock --json --tag "job:$job" latest 2>"$errfile") || rc=$?
-  else
-    json=$(restic snapshots --no-lock --json "$snap" 2>"$errfile") || rc=$?
-  fi
-  id=$(json_strings id <<<"$json")
-  if (( rc != 0 )) || [[ -z "$id" ]]; then
-    if (( rc != 0 )); then
-      printf "%serror:%s could not read the snapshots of job '%s' (restic exit %d)\n" "$C_RED" "$C_RESET" "$job" "$rc" >&2
-    elif [[ "$snap" == latest ]]; then
-      printf "%serror:%s job '%s' has no snapshots yet. Make one with: %s\n" "$C_RED" "$C_RESET" "$job" "$SUDO$PROG start $job" >&2
-      rc=1
-    else
-      printf "%serror:%s no snapshot matches '%s'. See the snapshots of job '%s' with: %s\n" "$C_RED" "$C_RESET" "$snap" "$job" "$SUDO$PROG snapshots $job" >&2
-      rc=1
-    fi
-    sed 's/^/  /' "$errfile" >&2
-    rm -f "$errfile"
-    return "$rc"
-  fi
-  rm -f "$errfile"
-  mapfile -t tags < <(json_strings tags <<<"$json")
-  for tag in "${tags[@]}"; do
-    if [[ "$tag" == "job:$job" ]]; then found=1; fi
-  done
-  (( found )) || die "snapshot ${id:0:8} was not made by job '$job'. See its snapshots with: $SUDO$PROG snapshots $job"
-
-  if [[ -n "$path" ]]; then
-    while [[ "$path" == */ && "$path" != / ]]; do path=${path%/}; done
-    roots=("$path")
-  else
-    mapfile -t roots < <(json_strings paths <<<"$json")
-  fi
-  time=$(json_strings time <<<"$json")
-  host=$(json_strings hostname <<<"$json")
-  header "Snapshot ${id:0:8} of job '$job', made ${time:0:10} ${time:11:5} on $host"
+  resolve_snapshot "$job" "$snap" "$path" || return
+  id=$SNAP_ID
+  roots=("${SNAP_ROOTS[@]}")
 
   if [[ "$mode" == tree ]]; then
     # tree reads the paths from restic ls instead of from a file system.
@@ -1773,6 +1789,252 @@ cmd_show() {
     warn "snapshot ${id:0:8} does not contain $(join_by ', ' "${missing[@]}")"
   fi
   return "$rc"
+}
+
+# ---------------------------------------------------------------------------
+# restore: put files from a snapshot back, in place or below another directory
+# ---------------------------------------------------------------------------
+
+# glob_escape TEXT -> TEXT with the characters that restic patterns treat
+# specially escaped, so --include matches the name literally
+glob_escape() {
+  local s=${1//\\/\\\\}
+  s=${s//\*/\\*}
+  s=${s//\?/\\?}
+  s=${s//\[/\\[}
+  printf '%s' "$s"
+}
+
+# dest_of TARGET PATH -> where PATH of a snapshot goes when restored to TARGET
+dest_of() {
+  if [[ "$1" == / ]]; then printf '%s' "$2"
+  elif [[ "$2" == / ]]; then printf '%s' "$1"
+  else printf '%s%s' "$1" "$2"
+  fi
+}
+
+# root_types ID PATH... -> "d<TAB>PATH" for each PATH that is a folder in
+# snapshot ID, and "f<TAB>PATH" for each that is a file or symlink
+root_types() {
+  local id=$1 out
+  shift
+  out=$(restic ls --no-lock --long "$id" "$@") || return
+  RESTORE_ROOTS=$(printf '%s\n' "$@") awk '
+    BEGIN { n = split(ENVIRON["RESTORE_ROOTS"], r, "\n"); for (i = 1; i <= n; i++) isroot[r[i]] = 1 }
+    # mode uid gid size date time path[ -> target]; the header line does not match.
+    match($0, /^[^ ]+ +[0-9]+ +[0-9]+ +[0-9]+ [0-9-]+ [0-9:]+ /) {
+      m = substr($0, 1, 1)
+      p = substr($0, RLENGTH + 1)
+      if (m == "L" && (k = index(p, " -> ")) > 0) p = substr(p, 1, k - 1)
+      if (p in isroot) print (m == "d" ? "d" : "f") "\t" p
+    }' <<<"$out"
+}
+
+# restore_plan DEST -> sums up the output of restic restore --dry-run --json -vv
+# into DEST, on stdin: a first line with the numbers of new, overwritten,
+# deleted and untouched files, then a line per new (n), overwritten (u) or
+# deleted (d) path, still JSON-escaped. Folders that restic merely sets up
+# again are not counted.
+restore_plan() {
+  RESTORE_DEST=$1 awk '
+    BEGIN { dest = ENVIRON["RESTORE_DEST"] }
+    /"message_type":"verbose_status"/ {
+      if (!match($0, /"action":"[a-z]+"/)) next
+      act = substr($0, RSTART + 10, RLENGTH - 11)
+      if (!match($0, /"item":"([^"\\]|\\.)*"/)) next
+      p = substr($0, RSTART + 8, RLENGTH - 9)
+      # Deleted paths come with the target; the others are relative to it.
+      if (act != "deleted" && dest != "/") p = dest p
+      n++; A[n] = act; P[n] = p
+      for (q = p; sub(/\/[^\/]*$/, "", q) && q != "";) isdir[q] = 1
+    }
+    END {
+      for (i = 1; i <= n; i++) {
+        if (A[i] == "restored" && !(P[i] in isdir)) { new++; out = out "n\t" P[i] "\n" }
+        else if (A[i] == "updated") { upd++; out = out "u\t" P[i] "\n" }
+        else if (A[i] == "deleted") { del++; out = out "d\t" P[i] "\n" }
+        else if (A[i] == "unchanged") same++
+      }
+      printf "%d %d %d %d\n%s", new, upd, del, same, out
+    }'
+}
+
+# plan_items KIND TITLE LIMIT -> lists the KIND paths of a restore plan on
+# stdin under TITLE, at most LIMIT of them, or all with LIMIT 0
+plan_items() {
+  local kind=$1 title=$2 limit=$3 n=0 line
+  local -a items=()
+  mapfile -t items < <(grep "^$kind"$'\t' || true)
+  (( ${#items[@]} > 0 )) || return 0
+  info "    $title:"
+  for line in "${items[@]}"; do
+    if (( limit > 0 && n >= limit )); then
+      note "      and $(( ${#items[@]} - n )) more. See them all with --dry-run"
+      break
+    fi
+    info "      $(json_unescape "${line#*$'\t'}")"
+    n=$(( n + 1 ))
+  done
+}
+
+# restore_args I -> sets args to the restic restore arguments of the I-th path
+# of cmd_restore (bash's dynamic scope gives access to its arrays)
+restore_args() {
+  args=("${srcs[$1]}" --target "${dests[$1]}" "${opts[@]}")
+  if (( dels[$1] )); then args+=(--delete); fi
+  if [[ -n "${incs[$1]}" ]]; then args+=(--include "${incs[$1]}"); fi
+}
+
+cmd_restore() {
+  local job='' snap='' path='' target=/ overwrite='' delete=0 dry_run=0 yes=0 arg id r kind line i out plan rc=0
+  local new upd del same changes=0
+  local -a orig=("$@") types=() missing=() srcs=() dests=() incs=() dels=() labels=() todo=() opts=() args=()
+  while (( $# > 0 )); do
+    arg=$1
+    shift
+    # --target=DIR works as well as --target DIR.
+    if [[ "$arg" == --*=* ]]; then set -- "${arg#*=}" "$@"; arg=${arg%%=*}; fi
+    case $arg in
+      --target)
+        [[ -n "${1:-}" ]] || die "--target needs a directory"
+        target=$1
+        shift ;;
+      --overwrite)
+        [[ "${1:-}" =~ ^(always|if-changed|if-newer|never)$ ]] || die "--overwrite needs always, if-changed, if-newer or never"
+        overwrite=$1
+        shift ;;
+      --delete)  delete=1 ;;
+      --dry-run) dry_run=1 ;;
+      -y|--yes)  yes=1 ;;
+      -*)        die "unknown option '$arg' (see '$PROG help')" ;;
+      /*)        [[ -z "$path" ]] || die "restore takes a single path"; path=$arg ;;
+      *)
+        if [[ -z "$job" ]]; then job=$arg
+        elif [[ -z "$snap" ]]; then snap=$arg
+        else die "usage: $PROG restore JOB [SNAPSHOT] [PATH] [--target DIR] [options]  (see '$PROG help')"
+        fi ;;
+    esac
+  done
+  [[ -n "$job" ]] || die "usage: $PROG restore JOB [SNAPSHOT] [PATH] [--target DIR] [options]  (see '$PROG help')"
+  validate_job_name "$job" || die "invalid job name '$job'"
+  snap=${snap:-latest}
+  check_snapshot_arg "$job" "$snap"
+  [[ "$target" == /* ]] || target="$PWD/$target"
+  while [[ "$target" == */ && "$target" != / ]]; do target=${target%/}; done
+  require_root restore "${orig[@]}"
+  [[ -f "$JOBS_DIR/$job/env" ]] || die "job '$job' is not configured. Run: $SUDO$PROG add $job"
+  require_restic
+  load_job_env "$job"
+  export_job_env
+  resolve_snapshot "$job" "$snap" "$path" || return
+  id=$SNAP_ID
+
+  # A folder is restored with itself as the target, so --delete cannot reach
+  # beyond it. A file is restored through its folder with --include, and
+  # --delete, which would act on that whole folder, is left out for it.
+  out=$(root_types "$id" "${SNAP_ROOTS[@]}") || rc=$?
+  if (( rc != 0 )); then
+    printf "%serror:%s could not read snapshot %s (restic exit %d)\n" "$C_RED" "$C_RESET" "${id:0:8}" "$rc" >&2
+    return "$rc"
+  fi
+  if [[ -n "$out" ]]; then mapfile -t types <<<"$out"; fi
+  for r in "${SNAP_ROOTS[@]}"; do
+    kind=''
+    for line in "${types[@]}"; do
+      if [[ "${line#*$'\t'}" == "$r" ]]; then kind=${line%%$'\t'*}; fi
+    done
+    if [[ -z "$kind" ]]; then missing+=("$r"); continue; fi
+    if [[ "$kind" == d ]]; then
+      srcs+=("$id:$r")
+      dests+=("$(dest_of "$target" "$r")")
+      incs+=('')
+      dels+=("$delete")
+      labels+=("$r")
+    else
+      if (( delete )) && [[ -n "$path" ]]; then die "--delete only works on folders, and $r is a file"; fi
+      srcs+=("$id:$(dirname "$r")")
+      dests+=("$(dest_of "$target" "$(dirname "$r")")")
+      incs+=("/$(glob_escape "$(basename "$r")")")
+      dels+=(0)
+      labels+=("$r (file)")
+    fi
+  done
+  if (( ${#missing[@]} > 0 )); then
+    (( ${#srcs[@]} > 0 )) || die "snapshot ${id:0:8} does not contain $(join_by ', ' "${missing[@]}")"
+    warn "snapshot ${id:0:8} does not contain $(join_by ', ' "${missing[@]}")"
+  fi
+
+  if [[ -n "$overwrite" ]]; then opts+=(--overwrite "$overwrite"); fi
+  case ${overwrite:-always} in
+    always)     info "Files that differ from the snapshot are overwritten." ;;
+    if-changed) info "Files that differ from the snapshot are overwritten. Files whose size and time match are taken as unchanged." ;;
+    if-newer)   info "Files that differ from the snapshot are overwritten, unless they are newer than the snapshot." ;;
+    never)      info "Files that exist are kept. Only missing files are restored." ;;
+  esac
+  if (( delete )); then info "Files in the restored folders that are not in the snapshot are deleted."; fi
+
+  # Preview every path with restic's dry run before anything is written.
+  for i in "${!srcs[@]}"; do
+    restore_args "$i"
+    out=$(restic restore --no-lock --json -vv --dry-run "${args[@]}") || rc=$?
+    if (( rc != 0 )); then
+      printf "%serror:%s could not plan the restore of %s (restic exit %d)\n" "$C_RED" "$C_RESET" "${labels[$i]}" "$rc" >&2
+      return "$rc"
+    fi
+    plan=$(restore_plan "${dests[$i]}" <<<"$out")
+    read -r new upd del same <<<"${plan%%$'\n'*}"
+    printf '\n'
+    if [[ "${dests[$i]}" == "${srcs[$i]#*:}" ]]; then
+      info "${labels[$i]}, in place:"
+    else
+      info "${labels[$i]}, to ${dests[$i]}:"
+    fi
+    if (( new + upd + del == 0 )); then
+      case ${overwrite:-always} in
+        always|if-changed) info "  nothing to restore: its $same file(s) match the snapshot" ;;
+        *)                 info "  nothing to restore: its $same file(s) exist and are kept" ;;
+      esac
+      continue
+    fi
+    todo+=("$i")
+    changes=$(( changes + new + upd + del ))
+    row "$new new" "files restored"
+    row "$upd overwritten" "files replaced by the snapshot's version"
+    if (( dels[i] )); then row "$del deleted" "files and folders not in the snapshot"; fi
+    row "$same untouched" "files that match the snapshot or are kept"
+    if (( dry_run )); then
+      plan_items n "New" 0 <<<"$plan"
+      plan_items u "Overwritten" 0 <<<"$plan"
+      plan_items d "Deleted" 0 <<<"$plan"
+    else
+      plan_items u "Overwritten" 20 <<<"$plan"
+      plan_items d "Deleted" 20 <<<"$plan"
+    fi
+  done
+  printf '\n'
+  if (( changes == 0 )); then
+    ok "nothing to restore"
+    return 0
+  fi
+  if (( dry_run )); then
+    note "Dry run: nothing was restored."
+    return 0
+  fi
+  if (( ! yes )); then
+    ask_yesno "Proceed?" n || die "nothing restored"
+  fi
+
+  header "Restoring"
+  for i in "${todo[@]}"; do
+    restore_args "$i"
+    info "==> ${labels[$i]}"
+    restic restore --retry-lock 30m "${args[@]}" || rc=$?
+    if (( rc != 0 )); then
+      printf "%serror:%s restoring %s failed (restic exit %d)\n" "$C_RED" "$C_RESET" "${labels[$i]}" "$rc" >&2
+      return "$rc"
+    fi
+  done
+  ok "restored ${#todo[@]} path(s) from snapshot ${id:0:8} of job '$job'"
 }
 
 # ---------------------------------------------------------------------------
@@ -2378,6 +2640,14 @@ Snapshots:
                       from snapshots, latest by default. PATH is an absolute
                       path in the snapshot. Without it, the backed-up paths
                       are shown. ls runs on a temporary FUSE mount.
+  restore JOB [SNAPSHOT] [PATH] [--target DIR] [--overwrite MODE] [--delete]
+          [--dry-run] [-y]
+                      Put files from a snapshot of JOB back, in place or below
+                      DIR, after showing what would change and asking. PATH
+                      limits it to one folder or file. MODE: always (default)
+                      overwrites files that differ, if-changed does so faster,
+                      if-newer keeps newer files, never only adds missing
+                      ones. --delete also removes files not in the snapshot.
   forget JOB --keep-last N | --older-than DURATION | --oldest N
              [--dry-run] [--prune | --no-prune] [-y]
                       List the snapshots of JOB to forget, ask, then forget
@@ -2421,6 +2691,7 @@ main() {
     run)               cmd_run "$@" ;;
     snapshots)         cmd_snapshots "$@" ;;
     show)              cmd_show "$@" ;;
+    restore)           cmd_restore "$@" ;;
     forget)            cmd_forget "$@" ;;
     help|-h|--help)    usage ;;
     version|--version) echo "$PROG $VERSION" ;;

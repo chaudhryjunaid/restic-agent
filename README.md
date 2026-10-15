@@ -21,6 +21,7 @@ resticagent status             # what ran, how it went, what runs next
 - **Monitoring built in.** `status` shows the last result and next run of every job and exits non-zero after a failure. `logs` opens the journal of a job or of its latest run.
 - **Run on demand.** `start` runs a job through systemd right now and streams its log, without ever overlapping a scheduled run.
 - **Snapshots per job.** `snapshots` lists a job's snapshots, and `show` shows what is in one with `ls -alh` or `tree`. `forget` deletes its oldest ones, or all but its newest, and lists exactly which ones go before asking.
+- **Restore with a preview.** `restore` puts files back in place or into another folder. It shows first what it would overwrite or delete, and asks.
 - **Clean removal.** `remove` deactivates and deletes jobs. It never touches the snapshots in a repository.
 - **One-step install, no root.** `setup.sh` installs it into `~/.local`, together with restic and tree if this machine lacks them, and removes it all again with `--uninstall`.
 - **No extra dependencies.** It needs bash, systemd and restic. Only `show` needs more: FUSE for its `ls` listing, and `tree` for `--tree`.
@@ -129,6 +130,7 @@ Things to know about your own jobs:
 | `logs [JOB]` | Show the journal of all jobs or one job |
 | `snapshots JOB` | List a job's snapshots |
 | `show JOB [SNAPSHOT] [PATH]` | Show the files in a snapshot with `ls -alh`, or with `tree` given `--tree` |
+| `restore JOB [SNAPSHOT] [PATH]` | Restore files in place, or below `--target DIR`, after previewing the changes |
 | `forget JOB` | Forget a job's snapshots by count or age, after listing them |
 | `remove JOB...` | Deactivate and delete jobs, or everything with `--all` |
 
