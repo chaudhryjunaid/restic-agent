@@ -1,9 +1,12 @@
 # Template service: one instance per job, e.g. restic-backup@home.service.
 # Installed by "resticagent install"; the timer of the same name starts it.
+# Run without root, install adds it as a user unit instead, with the program
+# and settings paths below changed to the user's own.
 [Unit]
 Description=restic backup job %i
 Documentation=https://restic.readthedocs.io/
 # Wait for the network so remote repositories (sftp, s3, rest) are reachable.
+# User units cannot see this system target, so they start without waiting.
 Wants=network-online.target
 After=network-online.target
 # Skip silently if the job has been removed but the timer is still around.
@@ -18,4 +21,5 @@ ExecStart=/usr/local/bin/resticagent run %i
 Nice=10
 IOSchedulingClass=best-effort
 IOSchedulingPriority=7
+# Left out of user units, where it needs user namespaces.
 PrivateTmp=true

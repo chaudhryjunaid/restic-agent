@@ -15,8 +15,9 @@ This guide covers every command, the configuration files, restoring data and tro
 
 ## Concepts
 
-- **Global settings** are shared by every job: the default repository, the password file, the cache directory, compression, and any backend credentials. They live in `/etc/resticagent/config`.
-- **A job** is one set of paths backed up on one schedule with one retention policy. Its name may contain letters, digits, `-` and `_`. Each job has a directory `/etc/resticagent/config.d/<job>/`.
+- **Your jobs or the system's.** Run as a regular user, resticagent manages your own jobs with your systemd user manager, without root. Run as root, it manages the system-wide jobs. This guide shows the paths and commands for your own jobs. For system-wide jobs, put `sudo` before each command and replace the paths as follows: `/etc/resticagent` for `~/.config/resticagent`, `/etc/systemd/system` for `~/.config/systemd/user`, and `/usr/local/bin` for `~/.local/bin`. See [Your backups or the system's](README.md#your-backups-or-the-systems) for which to choose.
+- **Global settings** are shared by every job: the default repository, the password file, the cache directory, compression, and any backend credentials. They live in `~/.config/resticagent/config`.
+- **A job** is one set of paths backed up on one schedule with one retention policy. Its name may contain letters, digits, `-` and `_`. Each job has a directory `~/.config/resticagent/config.d/<job>/`.
 - **The repository** is where restic stores snapshots. Jobs use the global repository unless they override it, and several jobs can share one repository.
 - **The job tag.** Every snapshot a job creates carries the tag `job:<job>`. Retention only ever considers snapshots with that tag.
 - **The timer** `restic-backup@<job>.timer` starts the service `restic-backup@<job>.service` on the job's schedule.
@@ -30,8 +31,8 @@ Creates or updates the global settings. `add` runs it automatically the first ti
 | Prompt | Default | Stored as |
 | --- | --- | --- |
 | Default restic repository | none, required | `RESTIC_REPOSITORY` |
-| Default password file | `/etc/resticagent/password` | `RESTIC_PASSWORD_FILE` |
-| restic cache directory | `/var/cache/restic` | `RESTIC_CACHE_DIR` |
+| Default password file | `~/.config/resticagent/password`, or `/etc/resticagent/password` for system-wide jobs | `RESTIC_PASSWORD_FILE` |
+| restic cache directory | `~/.cache/restic`, or `/var/cache/restic` for system-wide jobs | `RESTIC_CACHE_DIR` |
 | Compression (`auto`, `off`, `max`) | `auto` | `RESTIC_COMPRESSION` |
 | Additional environment variables | none | one `KEY=VALUE` per line |
 
@@ -82,8 +83,8 @@ Exclude patterns use restic's syntax, for example `**/node_modules`, `**/.cache`
 Creates or replaces one job from an env file, without prompts. On a host that has no global settings yet, the same file creates those too. A new machine can then be set up with one file and two commands:
 
 ```sh
-sudo ./bin/resticagent import home.env
-sudo ./bin/resticagent install
+./bin/resticagent import home.env
+./bin/resticagent install
 ```
 
 An example file:
@@ -123,7 +124,7 @@ Where each key goes:
 
 How restic settings and credentials are stored:
 
-- **On a host without global settings,** they create `/etc/resticagent/config`. The file must then set `RESTIC_REPOSITORY`. A missing `RESTIC_PASSWORD_FILE`, `RESTIC_CACHE_DIR` or `RESTIC_COMPRESSION` gets the same default as in `init`.
+- **On a host without global settings,** they create `~/.config/resticagent/config`. The file must then set `RESTIC_REPOSITORY`. A missing `RESTIC_PASSWORD_FILE`, `RESTIC_CACHE_DIR` or `RESTIC_COMPRESSION` gets the same default as in `init`.
 - **On a host with global settings,** a value equal to the global one is skipped. A different value is stored in the job's `env` file and applies to this job only. Importing one job therefore never changes another.
 - **With `--global`,** a different value updates the global settings instead, which affects every job.
 
@@ -141,13 +142,13 @@ Keep the file private, for example with `chmod 600 home.env`, because it can hol
 
 Installs and activates jobs. Without job names it installs every configured job. It is safe to run any number of times.
 
-1. It checks that systemd is running, that restic 0.17 or newer is installed, and that the global settings exist.
-2. It copies itself to `/usr/local/bin/resticagent` and the unit templates from the `systemd/` folder to `/etc/systemd/system/`.
+1. It checks that systemd is running and, for your own jobs, that your systemd user manager can be reached. It also checks that restic 0.17 or newer is installed, and that the global settings exist.
+2. It copies itself to `~/.local/bin/resticagent` and the unit templates from the `systemd/` folder to `~/.config/systemd/user/`. The templates get your own program and settings paths. User units leave out `PrivateTmp=`, which needs user namespaces there.
 3. It validates each job: source paths, repository, password file, schedule, random delay and retention rules.
 4. It opens each job's repository, unless `--skip-repo-check` is given. Jobs that share a repository and password are checked once.
 5. It writes each job's schedule to `restic-backup@<job>.timer.d/schedule.conf`.
 6. It reloads systemd if any unit file changed, enables and starts each timer, and restarts a running timer whose schedule changed.
-7. It prints each job's schedule and next run time.
+7. It prints each job's schedule and next run time. For your own jobs without lingering, it reminds you that the timers fire only while you are logged in.
 
 How the repository check affects a job:
 
@@ -184,15 +185,15 @@ Test an expression with `systemd-analyze calendar 'Mon..Fri 18:00'`.
 
 The random delay spreads runs out, so several machines or jobs don't all start at the same second. Use `0` to turn it off.
 
-Timers are persistent. If the machine was off when a run was due, the job runs shortly after the next boot.
+Timers are persistent. If the machine was off when a run was due, the job runs shortly after the next boot. Your own jobs' timers only fire while you are logged in, so a run missed while you were logged out starts at your next login. Run `loginctl enable-linger` once to have them fire whenever the machine is on.
 
 ### `resticagent start JOB [--no-wait]`
 
 Runs a job now through systemd, exactly as its timer would, and prints its log until the backup ends.
 
 ```sh
-sudo resticagent start home
-sudo resticagent start home --no-wait
+resticagent start home
+resticagent start home --no-wait
 ```
 
 - The run appears in `status` and `logs`, and it gets the service's lower CPU and disk priority.
@@ -209,7 +210,7 @@ Runs a job directly in your terminal, outside systemd. The service uses this com
 
 What a run does:
 
-1. It reads `/etc/resticagent/config`, then the job's `env`, so job values override global ones.
+1. It reads `~/.config/resticagent/config`, then the job's `env`, so job values override global ones.
 2. It runs `restic backup` with the job's `src` and `exclude` files, its tags, and `--one-file-system` if enabled.
 3. If the backup succeeded, or saved a snapshot with some unreadable files, it runs `restic forget` with the job's retention rules. It considers only snapshots tagged `job:<job>`, grouped by host, and adds `--prune` if enabled.
 
@@ -219,7 +220,7 @@ Both restic commands wait up to 30 minutes for a repository lock, so jobs that s
 
 ### `resticagent status [JOB]`
 
-Shows every configured or installed job. It does not need root.
+Shows every configured or installed job. It needs no root, also not for the system-wide jobs, which `resticagent --system status` shows.
 
 ```text
   JOB   TIMER   LAST RUN                     RESULT           NEXT RUN
@@ -240,7 +241,7 @@ With a job name, `status home` shows systemd's full status of the job's timer an
 
 ### `resticagent logs [JOB] [--last] [journalctl options]`
 
-Shows the journal of all jobs, or of one job. It does not need root, but you need permission to read the system journal, for example through the `adm` or `systemd-journal` group.
+Shows the journal of all jobs, or of one job. Your own jobs log to your user journal, which you can always read. `resticagent --system logs` shows the system-wide jobs without root, if you may read the system journal, for example through the `adm` or `systemd-journal` group.
 
 ```sh
 resticagent logs                      # all jobs, opened at the newest line
@@ -284,15 +285,26 @@ Retention uses short forms: `7d 4w 6m 1y` means 7 daily, 4 weekly, 6 monthly and
 - **After changing the schedule, run `install`.** `list` shows `needs install` until you do. Other changes take effect at the next run.
 - **To change global settings,** run `init` again.
 
+### Moving a system-wide job to your own
+
+1. Stop the system-wide job: `sudo resticagent remove <job>`. Keep its settings file or note its settings first, since this deletes its configuration.
+2. Give yourself the repository, if it is a local directory. Runs as root leave files that only root can read: `sudo chown -R "$USER": /path/to/repository`.
+3. Create the job as yourself with `resticagent import` or `resticagent add`. Its password file must be one you can read, such as the default `~/.config/resticagent/password`.
+4. Run `resticagent install <job>`.
+
+Snapshots made by the system-wide job stay in the repository. They carry the same `job:<job>` tag, so retention keeps treating them as part of the job.
+
 ## Removing jobs
 
 | Command | Effect |
 | --- | --- |
 | `remove home` | Stops and disables the job's timer, and deletes its schedule file and its configuration. |
 | `remove home --keep-config` | Deactivates the job but keeps its configuration, so `install` can bring it back. |
-| `remove --all` | Removes every job, the unit templates and `/usr/local/bin/resticagent`. The global settings and the password file stay. |
-| `remove --all --keep-config` | Uninstalls everything but keeps all configuration in `/etc/resticagent`. |
-| `remove --all --purge` | Uninstalls everything and deletes `/etc/resticagent`, including a password file stored there. |
+| `remove --all` | Removes every job, the unit templates and `~/.local/bin/resticagent`. The global settings and the password file stay. |
+| `remove --all --keep-config` | Uninstalls everything but keeps all configuration in `~/.config/resticagent`. |
+| `remove --all --purge` | Uninstalls everything and deletes `~/.config/resticagent`, including a password file stored there. |
+
+These only touch one set of jobs: your own, or the system-wide ones with `sudo`.
 
 `remove` lists what it will delete and asks before doing anything. Add `-y` to skip the question in scripts.
 
@@ -303,10 +315,9 @@ A backup that is running when you remove its job is allowed to finish. Snapshots
 resticagent schedules and runs backups. For restores, use restic directly with the job's settings loaded:
 
 ```sh
-sudo -i
 set -a
-. /etc/resticagent/config
-. /etc/resticagent/config.d/home/env
+. ~/.config/resticagent/config
+. ~/.config/resticagent/config.d/home/env
 set +a
 
 restic snapshots --tag job:home
@@ -315,7 +326,7 @@ restic restore latest --tag job:home --target /tmp/restore
 restic restore latest --tag job:home --target /tmp/restore --include /home/me/Documents
 ```
 
-`set -a` exports every variable the files define, so restic finds the repository, the password file and any credentials. Restore into a separate directory first, then copy back what you need.
+`set -a` exports every variable the files define, so restic finds the repository, the password file and any credentials. Restore into a separate directory first, then copy back what you need. For a system-wide job, start with `sudo -i` and load the files in `/etc/resticagent` instead.
 
 To browse snapshots like a folder, use `restic mount /mnt/restic`. This needs FUSE.
 
@@ -325,7 +336,7 @@ All files are plain text. Values are written as `KEY='VALUE'`, one per line, and
 
 `config` and each job's `env` have mode 0600, because they can hold credentials. `src` and `exclude` are readable by all users.
 
-### `/etc/resticagent/config`
+### `~/.config/resticagent/config`
 
 | Key | Meaning |
 | --- | --- |
@@ -335,12 +346,12 @@ All files are plain text. Values are written as `KEY='VALUE'`, one per line, and
 | `RESTIC_COMPRESSION` | `auto`, `off` or `max` |
 | any other key | Passed to restic as an environment variable, for example backend credentials |
 
-### `/etc/resticagent/config.d/<job>/env`
+### `~/.config/resticagent/config.d/<job>/env`
 
 | Key | Meaning | Example |
 | --- | --- | --- |
 | `RESTIC_REPOSITORY` | Overrides the global repository | `sftp:backup@nas:/srv/restic` |
-| `RESTIC_PASSWORD_FILE` | Overrides the global password file | `/etc/resticagent/nas.password` |
+| `RESTIC_PASSWORD_FILE` | Overrides the global password file | `/home/me/.config/resticagent/nas.password` |
 | `ON_CALENDAR` | The schedule, as a systemd calendar expression | `*-*-* 02:00:00` |
 | `RANDOMIZED_DELAY` | The largest random delay before a run | `30min` |
 | `KEEP_LAST` | Keep the N most recent snapshots | `3` |
@@ -360,11 +371,11 @@ Any other key is passed to restic for this job only, on top of the global settin
 
 When restic has fewer snapshots than a rule asks for, it may keep an extra older snapshot to fill the rule. New jobs therefore keep a few more snapshots than the numbers suggest until enough history exists.
 
-### `/etc/resticagent/config.d/<job>/src`
+### `~/.config/resticagent/config.d/<job>/src`
 
 One absolute path per line. The file is passed to `restic backup --files-from-verbatim`, so every line is taken literally. It can't contain comments, and paths with spaces need no quoting.
 
-### `/etc/resticagent/config.d/<job>/exclude`
+### `~/.config/resticagent/config.d/<job>/exclude`
 
 One restic exclude pattern per line, passed to `restic backup --exclude-file`. Lines starting with `#` are comments.
 
@@ -388,18 +399,24 @@ If the backup fails, retention is skipped. If the backup succeeds but `restic fo
 
 ## Troubleshooting
 
-**`error: this needs root`.** Prefix the command with `sudo`. Only `status`, `logs`, `help` and `version` work without root.
+**`error: system-wide jobs need root`.** The command was given `--system`. Prefix it with `sudo` to change the system-wide jobs, or leave out `--system` to work with your own. Only `status`, `logs`, `help` and `version` work with `--system` and without root.
 
-**`repository ... does not exist yet`.** Run `sudo resticagent install <job>` in a terminal and accept the offer to initialize the repository. Or create it yourself with `restic init`, with the settings loaded as shown in [Restoring files](#restoring-files).
+**`cannot reach the systemd user manager`.** Your own jobs need your systemd user manager, which a login session starts. A shell from `su` or `sudo -u` has none. Log in as that user directly, for example over SSH.
 
-**`wrong password for ...`.** The password file doesn't match the repository. Check the path with `sudo resticagent list <job>`, then fix the file's content.
+**`permission denied` in a backup of your own job.** Your own jobs can only back up files you can read. Back up other files with a system-wide job, created with `sudo`.
+
+**Your timers don't fire while you're logged out.** That is how user units work. Run `loginctl enable-linger` once to keep your systemd user manager running.
+
+**`repository ... does not exist yet`.** Run `resticagent install <job>` in a terminal and accept the offer to initialize the repository. Or create it yourself with `restic init`, with the settings loaded as shown in [Restoring files](#restoring-files).
+
+**`wrong password for ...`.** The password file doesn't match the repository. Check the path with `resticagent list <job>`, then fix the file's content.
 
 **A backup failed.** Run `resticagent logs <job> --last` to see the whole run, including restic's error message.
 
-**A timer never fires.** Run `resticagent status`. If the timer shows `not installed`, `inactive` or `disabled`, run `sudo resticagent install <job>`. To see systemd's own view, run `systemctl list-timers 'restic-backup@*'`.
+**A timer never fires.** Run `resticagent status`. If the timer shows `not installed`, `inactive` or `disabled`, run `resticagent install <job>`. To see systemd's own view, run `systemctl --user list-timers 'restic-backup@*'`, or `systemctl list-timers 'restic-backup@*'` for system-wide jobs.
 
-**The schedule didn't change.** `sudo resticagent list` shows `needs install` for the job. Run `sudo resticagent install <job>`.
+**The schedule didn't change.** `resticagent list` shows `needs install` for the job. Run `resticagent install <job>`.
 
 **`unable to create lock`, or exit code 11.** Another backup or prune is holding the repository lock, or a crashed run left a stale lock. Once no backup is running, load the job's settings and run `restic unlock`, which only removes stale locks.
 
-**A path in `src` doesn't exist.** restic logs `does not exist, skipping` and backs up the other paths, and the run still succeeds. Only when every path is missing does the backup fail. Check `resticagent logs <job> --last` for these warnings, and update the paths with `sudo resticagent add <job>`.
+**A path in `src` doesn't exist.** restic logs `does not exist, skipping` and backs up the other paths, and the run still succeeds. Only when every path is missing does the backup fail. Check `resticagent logs <job> --last` for these warnings, and update the paths with `resticagent add <job>`.
