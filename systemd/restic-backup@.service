@@ -1,0 +1,21 @@
+# Template service: one instance per job, e.g. restic-backup@home.service.
+# Installed by "resticagent install"; the timer of the same name starts it.
+[Unit]
+Description=restic backup job %i
+Documentation=https://restic.readthedocs.io/
+# Wait for the network so remote repositories (sftp, s3, rest) are reachable.
+Wants=network-online.target
+After=network-online.target
+# Skip silently if the job has been removed but the timer is still around.
+ConditionPathExists=/etc/resticagent/config.d/%i/env
+
+[Service]
+Type=oneshot
+# The script loads /etc/resticagent/config and config.d/%i/env itself, so a
+# manual "resticagent run %i" behaves exactly like a timer run.
+ExecStart=/usr/local/bin/resticagent run %i
+# Backups are I/O heavy; keep them out of the way of interactive work.
+Nice=10
+IOSchedulingClass=best-effort
+IOSchedulingPriority=7
+PrivateTmp=true

@@ -1,0 +1,1537 @@
+#!/usr/bin/env bash
+#
+# resticagent - manage restic backups as systemd services and timers.
+#
+# Configuration lives outside this repository, on the host:
+#   /etc/resticagent/config                  global settings shared by every job
+#   /etc/resticagent/config.d/<job>/env      job settings: schedule, retention, options
+#   /etc/resticagent/config.d/<job>/src      paths to back up, one per line
+#   /etc/resticagent/config.d/<job>/exclude  patterns to skip, one per line
+#
+# "install" adds these to the host:
+#   /usr/local/bin/resticagent                                    this script
+#   /etc/systemd/system/restic-backup@.service                    unit templates,
+#   /etc/systemd/system/restic-backup@.timer                      from ../systemd
+#   /etc/systemd/system/restic-backup@<job>.timer.d/schedule.conf per-job schedule
+#
+# Set RESTICAGENT_ROOT to a directory to prefix every path above (development
+# and tests). Root is then not needed: enable and disable act on the files
+# below that directory, other state-changing systemctl calls are only printed,
+# and read-only queries (show, status, journalctl) still go to the host.
+
+set -euo pipefail
+
+VERSION="0.4.0"
+ROOT="${RESTICAGENT_ROOT:-}"
+ROOT=${ROOT%/}
+CONFIG_DIR="$ROOT/etc/resticagent"
+GLOBAL_CONFIG="$CONFIG_DIR/config"
+JOBS_DIR="$CONFIG_DIR/config.d"
+SYSTEMD_DIR="$ROOT/etc/systemd/system"
+BIN_PATH="$ROOT/usr/local/bin/resticagent"
+UNIT_PREFIX="restic-backup@"
+# restic 0.17 added the exit codes (10 = no repository, 12 = wrong password)
+# that install relies on, and --retry-lock (0.16) is used by run.
+MIN_RESTIC_MINOR=17
+KEEP_RULES=(last hourly daily weekly monthly yearly within)
+# Message IDs systemd logs when a start job ends: successfully, or failed.
+MSG_UNIT_STARTED=39f53479d3a045ac8e11786248231fbf
+MSG_UNIT_FAILED=be02cf6855d2428ba40df7e9d022f03d
+PROG=$(basename "$0")
+SELF=$(readlink -f "${BASH_SOURCE[0]}")
+
+# ---------------------------------------------------------------------------
+# Output helpers
+# ---------------------------------------------------------------------------
+if [[ -t 1 ]]; then
+  C_BOLD=$'\e[1m' C_DIM=$'\e[2m' C_RED=$'\e[31m' C_GREEN=$'\e[32m' C_YELLOW=$'\e[33m' C_RESET=$'\e[0m'
+else
+  C_BOLD='' C_DIM='' C_RED='' C_GREEN='' C_YELLOW='' C_RESET=''
+fi
+
+info()   { printf '%s\n' "$*"; }
+note()   { printf '%s%s%s\n' "$C_DIM" "$*" "$C_RESET"; }
+ok()     { printf '%s+%s %s\n' "$C_GREEN" "$C_RESET" "$*"; }
+warn()   { printf '%s!%s %s\n' "$C_YELLOW" "$C_RESET" "$*" >&2; }
+die()    { printf '%serror:%s %s\n' "$C_RED" "$C_RESET" "$*" >&2; exit 1; }
+header() { printf '\n%s%s%s\n' "$C_BOLD" "$*" "$C_RESET"; }
+row()    { printf '  %-20s %s\n' "$1" "$2"; }
+
+require_root() {
+  [[ -n "$ROOT" ]] && return 0
+  [[ $EUID -eq 0 ]] || die "this needs root. Try: sudo $PROG $*"
+}
+
+# ---------------------------------------------------------------------------
+# Prompt helpers
+# ---------------------------------------------------------------------------
+
+# read_line VAR PROMPT [PREFILL]
+# On a terminal the input line is pre-filled with PREFILL and edited in place,
+# so clearing the line unsets an optional value. Without a terminal (piped
+# input) the default is shown in brackets and an empty answer selects it.
+read_line() {
+  local -n _rl_out=$1
+  local _rl_prompt=$2 _rl_prefill=${3:-}
+  if [[ -t 0 ]]; then
+    read -r -e -i "$_rl_prefill" -p "$_rl_prompt" _rl_out
+  else
+    printf '%s%s' "$_rl_prompt" "${_rl_prefill:+[$_rl_prefill] }"
+    read -r _rl_out || return 1
+    [[ -z "$_rl_out" && -n "$_rl_prefill" ]] && _rl_out=$_rl_prefill
+    printf '%s\n' "$_rl_out"
+  fi
+}
+
+# ask VAR PROMPT DEFAULT [VALIDATOR]
+# Re-prompts until VALIDATOR (a function name) accepts the answer. After a
+# rejected answer the line is pre-filled with what was typed so it can be fixed.
+ask() {
+  local -n _ask_out=$1
+  local _ask_prompt=$2 _ask_default=${3:-} _ask_validator=${4:-validate_value} _ask_value
+  while true; do
+    read_line _ask_value "$_ask_prompt: " "$_ask_default" || die "aborted"
+    if "$_ask_validator" "$_ask_value"; then
+      _ask_out=$_ask_value
+      return 0
+    fi
+    _ask_default=$_ask_value
+  done
+}
+
+# ask_yesno PROMPT DEFAULT(y|n) -> returns 0 for yes, 1 for no
+ask_yesno() {
+  local _yn_prompt=$1 _yn_default=$2 _yn_value _yn_hint
+  [[ $_yn_default == y ]] && _yn_hint='Y/n' || _yn_hint='y/N'
+  while true; do
+    if [[ -t 0 ]]; then
+      read -r -p "$_yn_prompt [$_yn_hint]: " _yn_value || die "aborted"
+    else
+      printf '%s' "$_yn_prompt [$_yn_hint]: "
+      read -r _yn_value || die "aborted"
+      printf '%s\n' "${_yn_value:-$_yn_default}"
+    fi
+    _yn_value=${_yn_value:-$_yn_default}
+    case ${_yn_value,,} in
+      y|yes) return 0 ;;
+      n|no)  return 1 ;;
+      *)     warn "please answer y or n" ;;
+    esac
+  done
+}
+
+yn_default() { [[ "$1" == 1 ]] && echo y || echo n; }
+
+# ask_list ARRAY TITLE HINT [VALIDATOR]
+# ARRAY may already hold the current entries; the user keeps or replaces them.
+# New entries are read one per line until an empty line.
+ask_list() {
+  local -n _al_arr=$1
+  local _al_title=$2 _al_hint=$3 _al_validator=${4:-validate_value} _al_line _al_i
+  info "$_al_title"
+  if (( ${#_al_arr[@]} > 0 )); then
+    for _al_i in "${!_al_arr[@]}"; do
+      printf '  %2d  %s\n' "$((_al_i + 1))" "${_al_arr[$_al_i]}"
+    done
+    if ask_yesno "Keep these ${#_al_arr[@]} entries?" y; then
+      return 0
+    fi
+    _al_arr=()
+  fi
+  note "$_al_hint"
+  note "One per line. Leave the line empty to finish."
+  while true; do
+    read_line _al_line "$(printf '  %2d> ' "$(( ${#_al_arr[@]} + 1 ))")" "" || break
+    [[ -n "$_al_line" ]] || break
+    if "$_al_validator" "$_al_line"; then
+      _al_arr+=("$_al_line")
+    fi
+  done
+}
+
+# ---------------------------------------------------------------------------
+# Validators: return 0 to accept, or print a hint and return 1 to re-prompt
+# ---------------------------------------------------------------------------
+
+# Every value is stored as KEY='VALUE'. Bash and systemd (EnvironmentFile=)
+# agree on single-quoted strings except for the single quote and the
+# backslash, so those two characters are refused everywhere.
+validate_value() {
+  case $1 in
+    *\'*|*\\*) warn "single quotes and backslashes are not allowed"; return 1 ;;
+  esac
+}
+
+validate_required() {
+  [[ -n "$1" ]] || { warn "a value is required"; return 1; }
+  validate_value "$1"
+}
+
+validate_job_name() {
+  [[ "$1" =~ ^[A-Za-z0-9][A-Za-z0-9_-]*$ ]] || { warn "use letters, digits, '-' and '_' only"; return 1; }
+}
+
+validate_abs_path() {
+  [[ "$1" == /* ]] || { warn "enter an absolute path starting with /"; return 1; }
+  validate_value "$1"
+}
+
+validate_abs_path_or_empty() {
+  [[ -z "$1" ]] || validate_abs_path "$1"
+}
+
+validate_src_path() {
+  validate_abs_path "$1" || return 1
+  [[ -e "$1" ]] || warn "$1 does not exist on this host (kept anyway)"
+}
+
+validate_int_or_empty() {
+  [[ -z "$1" || "$1" =~ ^[0-9]+$ ]] || { warn "enter a whole number or leave empty"; return 1; }
+}
+
+validate_restic_duration_or_empty() {
+  [[ -z "$1" || "$1" =~ ^([0-9]+[ymdh])+$ ]] || { warn "use restic durations such as 30d, 2m or 1y6m, or leave empty"; return 1; }
+}
+
+validate_compression() {
+  [[ "$1" =~ ^(auto|off|max)$ ]] || { warn "choose auto, off or max"; return 1; }
+}
+
+validate_calendar() {
+  validate_required "$1" || return 1
+  command -v systemd-analyze >/dev/null 2>&1 || return 0
+  local parsed
+  if ! parsed=$(systemd-analyze calendar -- "$1" 2>/dev/null); then
+    warn "systemd rejects that OnCalendar expression. Examples: daily, hourly, 'Mon..Fri 18:00', '*-*-* 02:00:00'"
+    return 1
+  fi
+  note "  next run: $(sed -n 's/^ *Next elapse: //p' <<<"$parsed")"
+}
+
+validate_timespan() {
+  validate_value "$1" || return 1
+  [[ -n "$1" ]] || return 0
+  command -v systemd-analyze >/dev/null 2>&1 || return 0
+  systemd-analyze timespan -- "$1" >/dev/null 2>&1 || { warn "systemd rejects that time span. Examples: 0, 30min, 1h"; return 1; }
+}
+
+validate_key_value() {
+  [[ "$1" =~ ^[A-Za-z_][A-Za-z0-9_]*=.+$ ]] || { warn "enter KEY=VALUE"; return 1; }
+  validate_value "${1#*=}"
+}
+
+# ---------------------------------------------------------------------------
+# Config file helpers
+# ---------------------------------------------------------------------------
+declare -A CUR=()    # one env file, used by the init and add prompts
+declare -A JENV=()   # a job's effective environment: global config + job env
+
+# read_env ARRAY FILE -> adds KEY=VALUE from each KEY='VALUE' line of FILE.
+# Parsing instead of sourcing means a config file can never run code.
+read_env() {
+  local -n _re_arr=$1
+  local _re_file=$2 _re_line
+  [[ -f "$_re_file" ]] || return 0
+  while IFS= read -r _re_line || [[ -n "$_re_line" ]]; do
+    if [[ "$_re_line" =~ ^([A-Za-z_][A-Za-z0-9_]*)=\'(.*)\'$ ]]; then
+      # _re_arr is an associative array, so the key must be expanded.
+      # shellcheck disable=SC2004
+      _re_arr[${BASH_REMATCH[1]}]=${BASH_REMATCH[2]}
+    fi
+  done <"$_re_file"
+}
+
+load_env() { CUR=(); read_env CUR "$1"; }
+
+# load_job_env JOB -> JENV holds the global settings overridden by the job's
+load_job_env() {
+  JENV=()
+  read_env JENV "$GLOBAL_CONFIG"
+  read_env JENV "$JOBS_DIR/$1/env"
+}
+
+export_job_env() {
+  local key
+  for key in "${!JENV[@]}"; do export "$key=${JENV[$key]}"; done
+}
+
+# load_lines ARRAY FILE -> the non-empty, non-comment lines of FILE
+load_lines() {
+  local -n _ll_arr=$1
+  local file=$2 line
+  _ll_arr=()
+  [[ -f "$file" ]] || return 0
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    [[ -z "$line" || "$line" == \#* ]] && continue
+    _ll_arr+=("$line")
+  done <"$file"
+}
+
+# env_line KEY VALUE -> prints KEY='VALUE'; prints nothing for an empty VALUE
+env_line() {
+  [[ -n "$2" ]] || return 0
+  printf "%s='%s'\n" "$1" "$2"
+}
+
+# list_jobs -> the configured job names, one per line
+list_jobs() {
+  local dir name
+  for dir in "$JOBS_DIR"/*/; do
+    [[ -d "$dir" ]] || continue
+    dir=${dir%/}
+    name=${dir##*/}
+    [[ "$name" =~ ^[A-Za-z0-9][A-Za-z0-9_-]*$ ]] && printf '%s\n' "$name"
+  done
+  return 0
+}
+
+# write_file DEST MODE  (content on stdin)
+# Touches DEST only when the content differs, so re-runs are no-ops.
+# Sets WRITE_CHANGED for this call and ANY_CHANGED for the whole command.
+# Call it with input redirection, not at the end of a pipe: a pipe runs it in
+# a subshell and the two flags would be lost.
+WRITE_CHANGED=0
+ANY_CHANGED=0
+write_file() {
+  local dest=$1 mode=$2 tmp
+  tmp=$(mktemp)
+  cat >"$tmp"
+  WRITE_CHANGED=1
+  if [[ -f "$dest" ]] && cmp -s "$tmp" "$dest"; then
+    chmod "$mode" "$dest"
+    info "  unchanged  $dest"
+    WRITE_CHANGED=0
+  elif [[ -f "$dest" ]]; then
+    install -m "$mode" "$tmp" "$dest"
+    ok "updated    $dest"
+  else
+    install -D -m "$mode" "$tmp" "$dest"
+    ok "created    $dest"
+  fi
+  rm -f "$tmp"
+  if (( WRITE_CHANGED )); then ANY_CHANGED=1; fi
+  return 0
+}
+
+# ensure_password_file PATH -> offers to create a missing restic password file
+ensure_password_file() {
+  local file=$1 p1 p2
+  [[ -n "$file" && ! -e "$file" ]] || return 0
+  warn "password file $file does not exist"
+  if ! ask_yesno "Create it now?" y; then
+    warn "create $file (mode 0600) before the first backup"
+    return 0
+  fi
+  while true; do
+    read -r -s -p "Repository password: " p1 || die "aborted"; printf '\n'
+    read -r -s -p "Repeat password: " p2 || die "aborted"; printf '\n'
+    [[ -n "$p1" && "$p1" == "$p2" ]] && break
+    warn "passwords are empty or do not match"
+  done
+  mkdir -p "$(dirname "$file")"
+  (umask 077 && printf '%s\n' "$p1" >"$file")
+  ok "created    $file (mode 0600)"
+}
+
+# ---------------------------------------------------------------------------
+# restic and systemd helpers
+# ---------------------------------------------------------------------------
+require_restic() {
+  command -v restic >/dev/null 2>&1 \
+    || die "restic is not installed. Install it with your package manager (apt, dnf, pacman, zypper) or from https://github.com/restic/restic/releases"
+  local version
+  version=$(restic version 2>/dev/null) || die "'restic version' failed"
+  if [[ "$version" =~ restic\ ([0-9]+)\.([0-9]+)\.([0-9]+) ]]; then
+    if (( BASH_REMATCH[1] == 0 && BASH_REMATCH[2] < MIN_RESTIC_MINOR )); then
+      die "restic ${BASH_REMATCH[1]}.${BASH_REMATCH[2]}.${BASH_REMATCH[3]} is too old, 0.$MIN_RESTIC_MINOR or newer is needed. Try 'sudo restic self-update' or a release from https://github.com/restic/restic/releases"
+    fi
+  else
+    warn "could not read the restic version from: $version"
+  fi
+}
+
+require_systemd() {
+  [[ -n "$ROOT" ]] && return 0
+  command -v systemctl >/dev/null 2>&1 && [[ -d /run/systemd/system ]] \
+    || die "systemd is not running on this host, and resticagent schedules backups with systemd timers"
+}
+
+# run_systemctl ARGS... -> systemctl for calls that change state. With
+# RESTICAGENT_ROOT set, enable, disable and is-enabled work offline on the
+# files below it, and calls that need a running manager are only printed.
+run_systemctl() {
+  if [[ -z "$ROOT" ]]; then
+    systemctl "$@"
+    return
+  fi
+  case ${1:-} in
+    enable|disable|is-enabled)
+      local arg
+      local -a args=()
+      for arg in "$@"; do
+        [[ "$arg" == --now ]] || args+=("$arg")
+      done
+      systemctl --root="$ROOT" "${args[@]}"
+      ;;
+    *)
+      note "  skipped (RESTICAGENT_ROOT is set): systemctl $*"
+      ;;
+  esac
+}
+
+unit_is_active() { systemctl is-active --quiet "$1" 2>/dev/null; }
+
+timer_unit()   { printf '%s%s.timer' "$UNIT_PREFIX" "$1"; }
+service_unit() { printf '%s%s.service' "$UNIT_PREFIX" "$1"; }
+dropin_dir()   { printf '%s/%s.d' "$SYSTEMD_DIR" "$(timer_unit "$1")"; }
+wants_link()   { printf '%s/timers.target.wants/%s' "$SYSTEMD_DIR" "$(timer_unit "$1")"; }
+
+# job_installed JOB -> true when the job has a timer drop-in or an enabled timer
+job_installed() {
+  [[ -d "$(dropin_dir "$1")" || -L "$(wants_link "$1")" ]]
+}
+
+timer_enabled() {
+  local state
+  state=$(run_systemctl is-enabled "$(timer_unit "$1")" 2>/dev/null || true)
+  [[ "$state" == enabled ]]
+}
+
+# A oneshot service is "activating" for as long as the backup runs.
+service_running() {
+  [[ "$(systemctl show -P ActiveState "$(service_unit "$1")" 2>/dev/null || true)" == activating ]]
+}
+
+# installed_jobs -> jobs with a timer drop-in or an enabled timer (may repeat)
+installed_jobs() {
+  local path name
+  for path in "$SYSTEMD_DIR/$UNIT_PREFIX"*.timer.d "$SYSTEMD_DIR/timers.target.wants/$UNIT_PREFIX"*.timer; do
+    [[ -e "$path" || -L "$path" ]] || continue
+    name=${path##*/"$UNIT_PREFIX"}
+    name=${name%.timer.d}
+    name=${name%.timer}
+    if [[ "$name" =~ ^[A-Za-z0-9][A-Za-z0-9_-]*$ ]]; then printf '%s\n' "$name"; fi
+  done
+}
+
+# known_jobs -> every configured or installed job, sorted, once each
+known_jobs() { { list_jobs; installed_jobs; } | sort -u; }
+
+# unit_props ARRAY UNIT PROP,PROP... -> ARRAY[PROP]=value from systemctl show
+unit_props() {
+  local -n _up_arr=$1
+  local _up_line
+  _up_arr=()
+  while IFS= read -r _up_line; do
+    [[ "$_up_line" == *=* ]] || continue
+    # _up_arr is an associative array, so the key must be expanded.
+    # shellcheck disable=SC2004
+    _up_arr[${_up_line%%=*}]=${_up_line#*=}
+  done < <(systemctl show --property="$3" "$2" 2>/dev/null || true)
+}
+
+# journal_last_run UNIT -> sets LAST_RUN_TIME and LAST_RUN_RESULT (done, failed,
+# ...) from the journal, which keeps the history across reboots when it is
+# persistent. Returns 1 when the journal has no finished run of UNIT.
+LAST_RUN_TIME='' LAST_RUN_RESULT=''
+journal_last_run() {
+  local line usec=''
+  LAST_RUN_TIME='' LAST_RUN_RESULT=''
+  while IFS= read -r line; do
+    case $line in
+      __REALTIME_TIMESTAMP=*) usec=${line#*=} ;;
+      JOB_RESULT=*)           LAST_RUN_RESULT=${line#*=} ;;
+    esac
+  done < <(journalctl -u "$1" "MESSAGE_ID=$MSG_UNIT_STARTED" "MESSAGE_ID=$MSG_UNIT_FAILED" \
+             -n 1 -o export --output-fields=JOB_RESULT --no-pager 2>/dev/null || true)
+  [[ -n "$LAST_RUN_RESULT" && "$usec" =~ ^[0-9]+$ ]] || return 1
+  LAST_RUN_TIME=$(date -d "@$(( usec / 1000000 ))" '+%a %Y-%m-%d %H:%M:%S %Z')
+}
+
+systemd_version() {
+  local out
+  out=$(systemctl --version 2>/dev/null || true)
+  if [[ "$out" =~ ^systemd\ ([0-9]+) ]]; then echo "${BASH_REMATCH[1]}"; else echo 0; fi
+}
+
+# next_run UNIT CALENDAR -> the timer's next trigger as systemd reports it, or
+# the next match of CALENDAR when the timer is not loaded
+next_run() {
+  local unit=$1 calendar=$2 when=''
+  when=$(systemctl show -P NextElapseUSecRealtime "$unit" 2>/dev/null || true)
+  if [[ -z "$when" ]]; then
+    when=$(systemd-analyze calendar -- "$calendar" 2>/dev/null | sed -n 's/^ *Next elapse: //p' || true)
+  fi
+  printf '%s' "${when:-unknown}"
+}
+
+# ---------------------------------------------------------------------------
+# init: global settings -> /etc/resticagent/config
+# ---------------------------------------------------------------------------
+cmd_init() {
+  require_root init
+  load_env "$GLOBAL_CONFIG"
+
+  local repo pwfile cache compression key kv
+  local -a extras=()
+  for key in "${!CUR[@]}"; do
+    case $key in
+      RESTIC_REPOSITORY|RESTIC_PASSWORD_FILE|RESTIC_CACHE_DIR|RESTIC_COMPRESSION) ;;
+      *) extras+=("$key=${CUR[$key]}") ;;
+    esac
+  done
+  if (( ${#extras[@]} > 0 )); then
+    mapfile -t extras < <(printf '%s\n' "${extras[@]}" | sort)
+  fi
+
+  header "Global settings  ($GLOBAL_CONFIG)"
+  note "Every job inherits these. A job can override the repository and password file."
+  ask repo        "Default restic repository (sftp:user@host:/path, s3:..., /mnt/backup)" "${CUR[RESTIC_REPOSITORY]:-}" validate_required
+  ask pwfile      "Default password file" "${CUR[RESTIC_PASSWORD_FILE]:-$CONFIG_DIR/password}" validate_abs_path
+  ask cache       "restic cache directory" "${CUR[RESTIC_CACHE_DIR]:-/var/cache/restic}" validate_abs_path
+  ask compression "Compression (auto, off, max)" "${CUR[RESTIC_COMPRESSION]:-auto}" validate_compression
+
+  header "Additional environment variables"
+  ask_list extras "Backend credentials and other restic settings, as KEY=VALUE (optional)." \
+    "Examples: AWS_ACCESS_KEY_ID=..., AWS_SECRET_ACCESS_KEY=..., B2_ACCOUNT_ID=..., RESTIC_PACK_SIZE=64" \
+    validate_key_value
+
+  header "Writing"
+  mkdir -p "$CONFIG_DIR"
+  write_file "$GLOBAL_CONFIG" 0600 < <(
+    printf '# resticagent global settings. Re-run "%s init" to change.\n' "$PROG"
+    printf '# Read by "%s run" before each job'"'"'s own env file.\n' "$PROG"
+    env_line RESTIC_REPOSITORY "$repo"
+    env_line RESTIC_PASSWORD_FILE "$pwfile"
+    env_line RESTIC_CACHE_DIR "$cache"
+    env_line RESTIC_COMPRESSION "$compression"
+    for kv in "${extras[@]}"; do env_line "${kv%%=*}" "${kv#*=}"; done
+  )
+  ensure_password_file "$pwfile"
+}
+
+# ---------------------------------------------------------------------------
+# add: one backup job -> /etc/resticagent/config.d/<job>/{env,src,exclude}
+# ---------------------------------------------------------------------------
+cmd_add() {
+  require_root add "$@"
+  if [[ ! -f "$GLOBAL_CONFIG" ]]; then
+    warn "no global settings yet, running '$PROG init' first"
+    cmd_init
+  fi
+
+  local job=${1:-}
+  if [[ -n "$job" ]]; then
+    validate_job_name "$job" || die "invalid job name '$job'"
+  else
+    ask job "Job name (letters, digits, '-' and '_')" "" validate_job_name
+  fi
+  local job_dir="$JOBS_DIR/$job"
+
+  load_env "$job_dir/env"
+  local -a src=() exclude=()
+  load_lines src "$job_dir/src"
+  load_lines exclude "$job_dir/exclude"
+  [[ -d "$job_dir" ]] && note "job '$job' already exists, prompts are pre-filled with its current values"
+
+  header "Repository  (job '$job')"
+  note "Leave empty to use the defaults from $GLOBAL_CONFIG."
+  local repo pwfile
+  ask repo   "Repository override"    "${CUR[RESTIC_REPOSITORY]:-}"    validate_value
+  ask pwfile "Password file override" "${CUR[RESTIC_PASSWORD_FILE]:-}" validate_abs_path_or_empty
+
+  header "Schedule"
+  local on_calendar delay
+  ask on_calendar "When to run (systemd OnCalendar: daily, hourly, 'Mon..Fri 18:00', '*-*-* 02:00:00')" "${CUR[ON_CALENDAR]:-daily}" validate_calendar
+  ask delay       "Random delay before each run (0, 30min, 1h)" "${CUR[RANDOMIZED_DELAY]:-15min}" validate_timespan
+
+  header "Retention  (which snapshots to keep)"
+  note "Leave a rule empty to skip it. At least one rule is required."
+  local keep_last keep_hourly keep_daily keep_weekly keep_monthly keep_yearly keep_within
+  while true; do
+    ask keep_last    "Keep the N most recent snapshots"       "${CUR[KEEP_LAST]:-}"     validate_int_or_empty
+    ask keep_hourly  "Keep N hourly snapshots"                "${CUR[KEEP_HOURLY]:-}"   validate_int_or_empty
+    ask keep_daily   "Keep N daily snapshots"                 "${CUR[KEEP_DAILY]:-7}"   validate_int_or_empty
+    ask keep_weekly  "Keep N weekly snapshots"                "${CUR[KEEP_WEEKLY]:-4}"  validate_int_or_empty
+    ask keep_monthly "Keep N monthly snapshots"               "${CUR[KEEP_MONTHLY]:-6}" validate_int_or_empty
+    ask keep_yearly  "Keep N yearly snapshots"                "${CUR[KEEP_YEARLY]:-1}"  validate_int_or_empty
+    ask keep_within  "Keep every snapshot newer than (30d, 1y6m)" "${CUR[KEEP_WITHIN]:-}" validate_restic_duration_or_empty
+    [[ -n "$keep_last$keep_hourly$keep_daily$keep_weekly$keep_monthly$keep_yearly$keep_within" ]] && break
+    warn "restic forget needs at least one keep rule"
+  done
+  local prune
+  if ask_yesno "Prune unreferenced data after forgetting snapshots?" "$(yn_default "${CUR[PRUNE]:-1}")"; then prune=1; else prune=0; fi
+
+  header "Backup options"
+  local tags one_fs
+  ask tags "Tags, comma separated" "${CUR[BACKUP_TAGS]:-$job}" validate_value
+  if ask_yesno "Stay on one file system (skip other mounts below the source paths)?" "$(yn_default "${CUR[ONE_FILE_SYSTEM]:-1}")"; then one_fs=1; else one_fs=0; fi
+
+  header "Source paths  ($job_dir/src)"
+  while true; do
+    ask_list src "Directories and files to back up." \
+      "Absolute paths, e.g. /home, /etc, /var/lib/docker/volumes." validate_src_path
+    (( ${#src[@]} > 0 )) && break
+    warn "a job needs at least one source path"
+  done
+
+  header "Exclude patterns  ($job_dir/exclude)"
+  ask_list exclude "Patterns restic should skip (optional)." \
+    "restic globs, e.g. **/node_modules, **/.cache, *.tmp, /home/*/.local/share/Trash" validate_value
+
+  local keep_summary=''
+  [[ -n "$keep_last" ]]    && keep_summary+="last $keep_last, "
+  [[ -n "$keep_hourly" ]]  && keep_summary+="hourly $keep_hourly, "
+  [[ -n "$keep_daily" ]]   && keep_summary+="daily $keep_daily, "
+  [[ -n "$keep_weekly" ]]  && keep_summary+="weekly $keep_weekly, "
+  [[ -n "$keep_monthly" ]] && keep_summary+="monthly $keep_monthly, "
+  [[ -n "$keep_yearly" ]]  && keep_summary+="yearly $keep_yearly, "
+  [[ -n "$keep_within" ]]  && keep_summary+="within $keep_within, "
+  keep_summary=${keep_summary%, }
+
+  header "Summary"
+  row "Job"            "$job"
+  row "Repository"     "${repo:-(global default)}"
+  row "Password file"  "${pwfile:-(global default)}"
+  row "Schedule"       "$on_calendar${delay:+ (+ up to $delay)}"
+  row "Keep"           "$keep_summary"
+  row "Prune"          "$(yn_default "$prune")"
+  row "Tags"           "$tags"
+  row "One file system" "$(yn_default "$one_fs")"
+  row "Sources"        "${#src[@]} path(s)"
+  row "Excludes"       "${#exclude[@]} pattern(s)"
+  ask_yesno "Write this configuration?" y || die "nothing written"
+
+  header "Writing"
+  mkdir -p "$job_dir"
+  write_file "$job_dir/env" 0600 < <(
+    printf "# resticagent job '%s'. Re-run \"%s add %s\" to change.\n" "$job" "$PROG" "$job"
+    printf '# Read by "%s run %s" after %s.\n' "$PROG" "$job" "${GLOBAL_CONFIG#"$ROOT"}"
+    env_line RESTIC_REPOSITORY    "$repo"
+    env_line RESTIC_PASSWORD_FILE "$pwfile"
+    env_line ON_CALENDAR          "$on_calendar"
+    env_line RANDOMIZED_DELAY     "$delay"
+    env_line KEEP_LAST            "$keep_last"
+    env_line KEEP_HOURLY          "$keep_hourly"
+    env_line KEEP_DAILY           "$keep_daily"
+    env_line KEEP_WEEKLY          "$keep_weekly"
+    env_line KEEP_MONTHLY         "$keep_monthly"
+    env_line KEEP_YEARLY          "$keep_yearly"
+    env_line KEEP_WITHIN          "$keep_within"
+    env_line BACKUP_TAGS          "$tags"
+    env_line ONE_FILE_SYSTEM      "$one_fs"
+    env_line PRUNE                "$prune"
+  )
+  # src is read with --files-from-verbatim: paths only, no comments.
+  write_file "$job_dir/src" 0644 < <(printf '%s\n' "${src[@]}")
+  write_file "$job_dir/exclude" 0644 < <(
+    printf "# Exclude patterns for resticagent job '%s' (restic --exclude-file syntax).\n" "$job"
+    if (( ${#exclude[@]} > 0 )); then printf '%s\n' "${exclude[@]}"; fi
+  )
+  ensure_password_file "$pwfile"
+  ok "job '$job' configured"
+  if [[ -f "$SYSTEMD_DIR/$(timer_unit "$job").d/schedule.conf" ]]; then
+    note "Apply the changes to its timer with: sudo $PROG install $job"
+  else
+    note "Activate it with: sudo $PROG install $job"
+  fi
+}
+
+# ---------------------------------------------------------------------------
+# install: program, unit templates, and one enabled timer per job
+# ---------------------------------------------------------------------------
+
+# check_job JOB -> loads JENV, prints every problem, returns 1 if not installable
+check_job() {
+  local job=$1 dir="$JOBS_DIR/$1" bad=0 path rule key has_rule=0
+  local -a src=()
+  if [[ ! -f "$dir/env" ]]; then
+    warn "$job: $dir/env is missing. Run: sudo $PROG add $job"
+    return 1
+  fi
+  load_job_env "$job"
+
+  load_lines src "$dir/src"
+  if (( ${#src[@]} == 0 )); then
+    warn "$job: no source paths in $dir/src"; bad=1
+  fi
+  for path in "${src[@]}"; do
+    [[ -e "$path" ]] || warn "$job: source $path does not exist on this host (restic will report it)"
+  done
+
+  [[ -n "${JENV[RESTIC_REPOSITORY]:-}" ]] || { warn "$job: no repository in the job or global settings"; bad=1; }
+
+  path=${JENV[RESTIC_PASSWORD_FILE]:-}
+  if [[ -z "$path" ]]; then
+    warn "$job: no password file in the job or global settings"; bad=1
+  elif [[ ! -r "$path" ]]; then
+    warn "$job: password file $path is missing. Re-run: sudo $PROG add $job"; bad=1
+  fi
+
+  if [[ -z "${JENV[ON_CALENDAR]:-}" ]] || ! systemd-analyze calendar -- "${JENV[ON_CALENDAR]}" >/dev/null 2>&1; then
+    warn "$job: ON_CALENDAR '${JENV[ON_CALENDAR]:-}' is not a valid systemd calendar expression"; bad=1
+  fi
+  if [[ -n "${JENV[RANDOMIZED_DELAY]:-}" ]] && ! systemd-analyze timespan -- "${JENV[RANDOMIZED_DELAY]}" >/dev/null 2>&1; then
+    warn "$job: RANDOMIZED_DELAY '${JENV[RANDOMIZED_DELAY]}' is not a valid systemd time span"; bad=1
+  fi
+
+  for rule in "${KEEP_RULES[@]}"; do
+    key="KEEP_${rule^^}"
+    [[ -n "${JENV[$key]:-}" ]] && has_rule=1
+  done
+  (( has_rule )) || { warn "$job: no KEEP_* retention rule"; bad=1; }
+
+  return "$bad"
+}
+
+# check_repo JOB -> opens the job's repository and offers to create a missing one.
+# Returns 1 only when the job cannot work (no repository, wrong password).
+# An unreachable repository is a warning, since the network may be down now.
+declare -A REPO_CHECKED=()
+check_repo() {
+  local job=$1 repo=${JENV[RESTIC_REPOSITORY]} out rc=0
+  local id="$repo|${JENV[RESTIC_PASSWORD_FILE]:-}"
+  if [[ -n "${REPO_CHECKED[$id]:-}" ]]; then
+    if (( REPO_CHECKED[$id] != 0 )); then
+      warn "$job: uses the same repository and password as a job that failed above"
+    fi
+    return "${REPO_CHECKED[$id]}"
+  fi
+  out=$(export_job_env; timeout 120 restic --no-lock --no-cache cat config 2>&1 >/dev/null) || rc=$?
+  case $rc in
+    0)
+      ok "repository $repo opens"
+      ;;
+    10)
+      warn "$job: repository $repo does not exist yet"
+      if [[ -t 0 ]] && ask_yesno "Initialize a new restic repository there?" y; then
+        if (export_job_env; restic --no-cache init); then
+          ok "initialized $repo"
+          rc=0
+        else
+          warn "$job: restic init failed"
+          rc=1
+        fi
+      else
+        warn "$job: to create it, re-run 'sudo $PROG install $job' in a terminal"
+        rc=1
+      fi
+      ;;
+    12)
+      warn "$job: wrong password for $repo (password file ${JENV[RESTIC_PASSWORD_FILE]:-})"
+      rc=1
+      ;;
+    124)
+      warn "$job: no answer from $repo within 120s, activating anyway"
+      rc=0
+      ;;
+    *)
+      warn "$job: could not open $repo (restic exit $rc): $(tail -n 1 <<<"$out")"
+      warn "$job: activating anyway. Test it with: sudo $PROG run $job"
+      rc=0
+      ;;
+  esac
+  REPO_CHECKED[$id]=$rc
+  return "$rc"
+}
+
+# render_dropin JOB -> the timer drop-in that carries the job's schedule.
+# The empty OnCalendar= clears the template's placeholder, because
+# OnCalendar values from drop-ins are added to the list, not substituted.
+render_dropin() {
+  local job=$1
+  local calendar=${JENV[ON_CALENDAR]:-} delay=${JENV[RANDOMIZED_DELAY]:-0}
+  cat <<DROPIN
+# Generated by "resticagent install" from ${JOBS_DIR#"$ROOT"}/$job/env.
+# Change the job with "resticagent add $job", then run "resticagent install $job".
+[Timer]
+OnCalendar=
+OnCalendar=${calendar//%/%%}
+RandomizedDelaySec=${delay//%/%%}
+DROPIN
+}
+
+install_program() {
+  if [[ "$SELF" == "$(readlink -f "$BIN_PATH" 2>/dev/null || true)" ]]; then
+    info "  running    $BIN_PATH (the installed copy)"
+    return 0
+  fi
+  write_file "$BIN_PATH" 0755 <"$SELF"
+}
+
+install_templates() {
+  local src_dir unit
+  src_dir=$(readlink -f "$(dirname "$SELF")/../systemd" 2>/dev/null || true)
+  if [[ -n "$src_dir" && -f "$src_dir/${UNIT_PREFIX}.service" && -f "$src_dir/${UNIT_PREFIX}.timer" ]]; then
+    for unit in "${UNIT_PREFIX}.service" "${UNIT_PREFIX}.timer"; do
+      write_file "$SYSTEMD_DIR/$unit" 0644 <"$src_dir/$unit"
+    done
+  elif [[ -f "$SYSTEMD_DIR/${UNIT_PREFIX}.service" && -f "$SYSTEMD_DIR/${UNIT_PREFIX}.timer" ]]; then
+    note "  unit templates are not next to $SELF, keeping the installed ones"
+  else
+    die "unit templates not found. Run install from the repository checkout: sudo ./bin/resticagent install"
+  fi
+}
+
+cmd_install() {
+  local skip_repo_check=0 all_jobs=0 arg job unit was_active
+  local -a jobs=() ready=() failed=()
+  local -A changed=() schedule=()
+  for arg in "$@"; do
+    case $arg in
+      --skip-repo-check) skip_repo_check=1 ;;
+      -*) die "unknown option '$arg' (see '$PROG help')" ;;
+      *)  validate_job_name "$arg" || die "invalid job name '$arg'"; jobs+=("$arg") ;;
+    esac
+  done
+  require_root install "$@"
+  require_systemd
+  require_restic
+  [[ -f "$GLOBAL_CONFIG" ]] || die "no global settings at $GLOBAL_CONFIG. Run: sudo $PROG init"
+  if (( ${#jobs[@]} == 0 )); then
+    all_jobs=1
+    mapfile -t jobs < <(list_jobs)
+    (( ${#jobs[@]} > 0 )) || die "no jobs in $JOBS_DIR. Run: sudo $PROG add <job>"
+  fi
+  for job in "${jobs[@]}"; do
+    [[ -d "$JOBS_DIR/$job" ]] || die "no job '$job' in $JOBS_DIR. Run: sudo $PROG add $job"
+  done
+
+  header "Program and unit templates"
+  install_program
+  install_templates
+
+  header "Jobs"
+  for job in "${jobs[@]}"; do
+    if ! check_job "$job"; then failed+=("$job"); continue; fi
+    if (( ! skip_repo_check )) && ! check_repo "$job"; then failed+=("$job"); continue; fi
+    write_file "$SYSTEMD_DIR/$(timer_unit "$job").d/schedule.conf" 0644 < <(render_dropin "$job")
+    if (( WRITE_CHANGED )); then changed[$job]=1; fi
+    schedule[$job]="${JENV[ON_CALENDAR]}"
+    ready+=("$job")
+  done
+
+  if (( all_jobs )); then
+    while IFS= read -r job; do
+      [[ -d "$JOBS_DIR/$job" ]] && continue
+      warn "the timer for job '$job' is installed but its config is gone, so its runs are skipped"
+      warn "clean it up with: sudo $PROG remove $job"
+    done < <(installed_jobs | sort -u)
+  fi
+
+  header "Activating"
+  if (( ANY_CHANGED )); then
+    run_systemctl daemon-reload
+    ok "reloaded   systemd units"
+  fi
+  for job in "${ready[@]}"; do
+    unit=$(timer_unit "$job")
+    was_active=0
+    unit_is_active "$unit" && was_active=1
+    # enable is idempotent: it creates the boot symlink only if missing.
+    run_systemctl enable --now --quiet "$unit"
+    if (( was_active )) && [[ -n "${changed[$job]:-}" ]]; then
+      # A running timer keeps its old next-run time until restarted.
+      run_systemctl restart "$unit"
+      ok "restarted  $unit (schedule changed)"
+    elif (( was_active )); then
+      info "  active     $unit"
+    else
+      ok "started    $unit"
+    fi
+  done
+
+  header "Summary"
+  if (( ${#ready[@]} > 0 )); then
+    printf '  %-16s %-24s %s\n' JOB SCHEDULE "NEXT RUN"
+    for job in "${ready[@]}"; do
+      printf '  %-16s %-24s %s\n' "$job" "${schedule[$job]}" "$(next_run "$(timer_unit "$job")" "${schedule[$job]}")"
+    done
+  fi
+  if (( ${#failed[@]} > 0 )); then
+    warn "not activated: ${failed[*]} (see the messages above)"
+    return 1
+  fi
+  ok "${#ready[@]} job(s) active"
+}
+
+# ---------------------------------------------------------------------------
+# start: run a job now through systemd, exactly as its timer would
+# ---------------------------------------------------------------------------
+
+# A start job stays queued in systemd until the oneshot service has exited.
+job_pending() {
+  [[ -n "$(systemctl list-jobs --no-legend "$1" 2>/dev/null || true)" ]]
+}
+
+# journal_tail_cursor UNIT -> the cursor of UNIT's newest journal entry, or empty
+journal_tail_cursor() {
+  journalctl -u "$1" -n 1 -q -o cat --no-pager --show-cursor 2>/dev/null | sed -n 's/^-- cursor: //p' || true
+}
+
+# journal_print_new UNIT FROM... -> prints UNIT's journal entries newer than
+# FOLLOW_CURSOR, or on the first call those selected by FROM (--after-cursor C
+# or --since T), and advances FOLLOW_CURSOR. Polling with a cursor never loses
+# or repeats a line, unlike killing a "journalctl -f" that may still be behind.
+FOLLOW_CURSOR=''
+journal_print_new() {
+  local line
+  local -a args=(-u "$1" -q -o cat --no-pager --show-cursor)
+  if [[ -n "$FOLLOW_CURSOR" ]]; then args+=(--after-cursor "$FOLLOW_CURSOR"); else args+=("${@:2}"); fi
+  while IFS= read -r line; do
+    if [[ "$line" == "-- cursor: "* ]]; then
+      FOLLOW_CURSOR=${line#-- cursor: }
+    else
+      printf '%s\n' "$line"
+    fi
+  done < <(journalctl "${args[@]}" 2>/dev/null || true)
+}
+
+# journal_run_result UNIT FROM... -> the JOB_RESULT (done, failed, ...) systemd
+# logged when the run of UNIT after FROM ended; empty until then
+journal_run_result() {
+  journalctl -u "$1" "MESSAGE_ID=$MSG_UNIT_STARTED" "MESSAGE_ID=$MSG_UNIT_FAILED" "${@:2}" \
+    -n 1 -o export --output-fields=JOB_RESULT --no-pager 2>/dev/null | sed -n 's/^JOB_RESULT=//p' || true
+}
+
+cmd_start() {
+  local job='' wait=1 arg unit since started errfile result status job_result='' tries rc=0 interrupted=0
+  local -a start_from=()
+  for arg in "$@"; do
+    case $arg in
+      --no-wait) wait=0 ;;
+      -*)        die "unknown option '$arg' (see '$PROG help')" ;;
+      *)         [[ -z "$job" ]] || die "start takes a single job"; job=$arg ;;
+    esac
+  done
+  [[ -n "$job" ]] || die "usage: $PROG start JOB [--no-wait]"
+  validate_job_name "$job" || die "invalid job name '$job'"
+  require_root start "$@"
+  require_systemd
+  [[ -f "$JOBS_DIR/$job/env" ]] || die "job '$job' is not configured. Run: sudo $PROG add $job"
+  [[ -f "$SYSTEMD_DIR/${UNIT_PREFIX}.service" ]] \
+    || die "the systemd units are not installed yet. Run: sudo $PROG install $job"
+  if ! job_installed "$job"; then
+    note "job '$job' has no timer yet, so it only runs when started by hand. Schedule it with: sudo $PROG install $job"
+  fi
+  unit=$(service_unit "$job")
+
+  if [[ -n "$ROOT" ]]; then
+    run_systemctl start --no-block "$unit"
+    return 0
+  fi
+
+  if service_running "$job" || job_pending "$unit"; then
+    # Never start a second copy; follow the run in progress instead.
+    started=$(systemctl show -P ExecMainStartTimestamp "$unit" 2>/dev/null || true)
+    since=$(systemctl show --timestamp=unix -P ExecMainStartTimestamp "$unit" 2>/dev/null || true)
+    # systemd before 247 has no --timestamp=unix; then follow from now.
+    [[ "$since" == @* ]] || since="@$(date +%s)"
+    start_from=(--since "$since")
+    info "A backup of '$job' is already running, since ${started:-a moment ago}."
+    if (( ! wait )); then
+      note "Follow it with: $PROG logs $job -f"
+      return 0
+    fi
+  else
+    # Follow from the unit's newest journal entry, so not even a line of a
+    # run that ended in the same second shows up. Timestamps are too coarse.
+    since=$(journal_tail_cursor "$unit")
+    if [[ -n "$since" ]]; then start_from=(--after-cursor "$since"); else start_from=(--since "@$(date +%s)"); fi
+    errfile=$(mktemp)
+    if ! run_systemctl start --no-block "$unit" 2>"$errfile"; then
+      printf '%serror:%s could not start %s\n' "$C_RED" "$C_RESET" "$unit" >&2
+      sed 's/^/  /' "$errfile" >&2
+      rm -f "$errfile"
+      return 1
+    fi
+    rm -f "$errfile"
+    if (( ! wait )); then
+      ok "started    $unit"
+      note "Follow it with: $PROG logs $job -f    Check the result with: $PROG status"
+      return 0
+    fi
+  fi
+  info "==> $unit  (Ctrl-C stops following; the backup keeps running)"
+
+  FOLLOW_CURSOR=''
+  trap 'interrupted=1' INT
+  while (( ! interrupted )) && { job_pending "$unit" || service_running "$job"; }; do
+    journal_print_new "$unit" "${start_from[@]}"
+    sleep 0.5 || true
+  done
+  # systemd logs the end of the run as the job completes, but journald may
+  # store it a moment later. Print up to and including that message.
+  for (( tries = 0; tries < 15 && ! interrupted; tries++ )); do
+    job_result=$(journal_run_result "$unit" "${start_from[@]}")
+    journal_print_new "$unit" "${start_from[@]}"
+    [[ -z "$job_result" ]] || break
+    sleep 0.2 || true
+  done
+  trap - INT
+
+  if (( interrupted )) && { job_pending "$unit" || service_running "$job"; }; then
+    printf '\n'
+    warn "stopped following. The backup of '$job' continues in the background."
+    note "Follow it again with: $PROG logs $job -f    Check the result with: $PROG status"
+    return 130
+  fi
+
+  result=$(systemctl show -P Result "$unit" 2>/dev/null || true)
+  status=$(systemctl show -P ExecMainStatus "$unit" 2>/dev/null || true)
+  printf '\n'
+  if [[ "$job_result" == "done" || ( -z "$job_result" && "$result" == success ) ]]; then
+    ok "backup of '$job' finished successfully"
+    return 0
+  fi
+  if [[ "$result" == exit-code && "$status" =~ ^[0-9]+$ && "$status" != 0 ]]; then
+    if [[ "$status" == 3 ]]; then
+      warn "backup of '$job' finished, but some files could not be read (exit 3)"
+    else
+      printf "%serror:%s backup of '%s' failed (exit %s)\n" "$C_RED" "$C_RESET" "$job" "$status" >&2
+    fi
+    note "See the whole run with: $PROG logs $job --last"
+    rc=$status
+  else
+    printf "%serror:%s backup of '%s' did not complete (%s)\n" "$C_RED" "$C_RESET" "$job" "${job_result:-${result:-unknown result}}" >&2
+    note "See the whole run with: $PROG logs $job --last"
+    rc=1
+  fi
+  return "$rc"
+}
+
+# ---------------------------------------------------------------------------
+# run: one backup plus retention; this is what the systemd service executes
+# ---------------------------------------------------------------------------
+cmd_run() {
+  local job=${1:-} rule key rc=0
+  [[ -n "$job" ]] || die "usage: $PROG run JOB"
+  validate_job_name "$job" || die "invalid job name '$job'"
+  require_root run "$@"
+  local dir="$JOBS_DIR/$job"
+  [[ -f "$dir/env" && -f "$dir/src" ]] || die "job '$job' is not configured. Run: sudo $PROG add $job"
+  require_restic
+  load_job_env "$job"
+  export_job_env
+
+  # Every snapshot carries job:<name>, so forget only ever touches this job's
+  # snapshots, even when several jobs share one repository.
+  local -a backup=(backup --retry-lock 30m --files-from-verbatim "$dir/src" --tag "job:$job")
+  [[ -f "$dir/exclude" ]] && backup+=(--exclude-file "$dir/exclude")
+  [[ "${JENV[ONE_FILE_SYSTEM]:-0}" == 1 ]] && backup+=(--one-file-system)
+  [[ -n "${JENV[BACKUP_TAGS]:-}" ]] && backup+=(--tag "${JENV[BACKUP_TAGS]}")
+
+  # Grouping by host alone keeps retention stable when the source list changes.
+  local -a forget=(forget --retry-lock 30m --tag "job:$job" --group-by host)
+  local -a keep=()
+  for rule in "${KEEP_RULES[@]}"; do
+    key="KEEP_${rule^^}"
+    if [[ -n "${JENV[$key]:-}" ]]; then keep+=("--keep-$rule" "${JENV[$key]}"); fi
+  done
+  [[ "${JENV[PRUNE]:-0}" == 1 ]] && forget+=(--prune)
+
+  info "==> backup of job '$job' to ${JENV[RESTIC_REPOSITORY]:-?}"
+  restic "${backup[@]}" || rc=$?
+  case $rc in
+    0) ;;
+    3) warn "some source files could not be read, the snapshot was saved without them" ;;
+    *) printf 'error: backup failed (restic exit %d), retention not applied\n' "$rc" >&2; return "$rc" ;;
+  esac
+
+  if (( ${#keep[@]} == 0 )); then
+    warn "no KEEP_* rules for job '$job', retention not applied"
+    return "$rc"
+  fi
+  info "==> retention for job '$job': ${keep[*]}"
+  local forget_rc=0
+  restic "${forget[@]}" "${keep[@]}" || forget_rc=$?
+  if (( forget_rc != 0 )); then
+    printf 'error: forget failed (restic exit %d)\n' "$forget_rc" >&2
+    return "$forget_rc"
+  fi
+  return "$rc"
+}
+
+# ---------------------------------------------------------------------------
+# Shared output helpers for list and status
+# ---------------------------------------------------------------------------
+
+# tsv CELL... -> the cells joined by tabs, one table row
+tsv() { local IFS=$'\t'; printf '%s' "$*"; }
+
+# table ROW... -> aligned columns; the first ROW is the header. Cells must not
+# be empty (use "-"), because read collapses consecutive tabs.
+table() {
+  local -a widths=() cells=()
+  local row i last line bold=$C_BOLD
+  for row in "$@"; do
+    IFS=$'\t' read -r -a cells <<<"$row"
+    for i in "${!cells[@]}"; do
+      if (( ${#cells[i]} > ${widths[i]:-0} )); then widths[i]=${#cells[i]}; fi
+    done
+  done
+  for row in "$@"; do
+    IFS=$'\t' read -r -a cells <<<"$row"
+    last=$(( ${#cells[@]} - 1 ))
+    line=''
+    for i in "${!cells[@]}"; do
+      if (( i < last )); then
+        printf -v line '%s%-*s  ' "$line" "${widths[i]}" "${cells[i]}"
+      else
+        line+=${cells[i]}
+      fi
+    done
+    printf '  %s%s%s\n' "$bold" "$line" "$C_RESET"
+    bold=''
+  done
+}
+
+describe_file() {
+  if [[ -z "$1" ]]; then printf -- '-'
+  elif [[ -r "$1" ]]; then printf '%s (present)' "$1"
+  else printf '%s (missing)' "$1"
+  fi
+}
+
+yes_no() { if [[ "$1" == 1 ]]; then printf yes; else printf no; fi; }
+
+# origin KEY -> whether KEY comes from the job's env (in CUR) or the global config
+origin() { if [[ -n "${CUR[$1]:-}" ]]; then printf '(job)'; else printf '(global)'; fi; }
+
+# retention_summary short|long -> the keep rules in JENV, e.g. "last 3 7d 4w"
+retention_summary() {
+  local style=$1 rule key value out=''
+  for rule in "${KEEP_RULES[@]}"; do
+    key="KEEP_${rule^^}"
+    value=${JENV[$key]:-}
+    [[ -n "$value" ]] || continue
+    if [[ "$style" == long ]]; then
+      out+="$rule $value, "
+    else
+      case $rule in
+        last|within) out+="$rule $value " ;;
+        *)           out+="$value${rule:0:1} " ;;
+      esac
+    fi
+  done
+  out=${out%, }
+  out=${out% }
+  printf '%s' "${out:--}"
+}
+
+# install_state JOB -> installed | disabled | needs install | not installed | orphaned
+# "needs install" means the schedule in the job's env differs from its timer.
+install_state() {
+  local job=$1 dropin
+  dropin="$(dropin_dir "$job")/schedule.conf"
+  if [[ ! -d "$JOBS_DIR/$job" ]]; then echo orphaned; return 0; fi
+  if [[ ! -f "$dropin" ]]; then echo "not installed"; return 0; fi
+  load_job_env "$job"
+  if ! cmp -s "$dropin" <(render_dropin "$job"); then echo "needs install"; return 0; fi
+  if timer_enabled "$job"; then echo installed; else echo disabled; fi
+}
+
+# ---------------------------------------------------------------------------
+# list: what is configured, and whether it is installed
+# ---------------------------------------------------------------------------
+cmd_list() {
+  local job=${1:-} state key hint_install=0 hint_orphan=0
+  local -a jobs=() rows=() src=() others=()
+  if [[ -n "$job" ]]; then
+    validate_job_name "$job" || die "invalid job name '$job'"
+  fi
+  require_root list "$@"
+  if [[ -n "$job" ]]; then
+    list_job "$job"
+    return
+  fi
+
+  header "Global settings  ($GLOBAL_CONFIG)"
+  if [[ -f "$GLOBAL_CONFIG" ]]; then
+    load_env "$GLOBAL_CONFIG"
+    row "Repository"    "${CUR[RESTIC_REPOSITORY]:--}"
+    row "Password file" "$(describe_file "${CUR[RESTIC_PASSWORD_FILE]:-}")"
+    row "Cache"         "${CUR[RESTIC_CACHE_DIR]:--}"
+    row "Compression"   "${CUR[RESTIC_COMPRESSION]:--}"
+    for key in "${!CUR[@]}"; do
+      case $key in
+        RESTIC_REPOSITORY|RESTIC_PASSWORD_FILE|RESTIC_CACHE_DIR|RESTIC_COMPRESSION) ;;
+        *) others+=("$key") ;;
+      esac
+    done
+    if (( ${#others[@]} > 0 )); then
+      mapfile -t others < <(printf '%s\n' "${others[@]}" | sort)
+      row "Other variables" "${others[*]} (values hidden)"
+    fi
+  else
+    warn "not configured yet. Run: sudo $PROG init"
+  fi
+
+  header "Jobs"
+  mapfile -t jobs < <(known_jobs)
+  if (( ${#jobs[@]} == 0 )); then
+    info "  none yet. Add one with: sudo $PROG add <job>"
+    return 0
+  fi
+  rows=("$(tsv JOB STATE SCHEDULE RETENTION SOURCES)")
+  for job in "${jobs[@]}"; do
+    state=$(install_state "$job")
+    case $state in
+      orphaned) hint_orphan=1 ;;
+      installed) ;;
+      *) hint_install=1 ;;
+    esac
+    if [[ "$state" == orphaned ]]; then
+      rows+=("$(tsv "$job" "timer without config" - - -)")
+      continue
+    fi
+    load_job_env "$job"
+    load_lines src "$JOBS_DIR/$job/src"
+    rows+=("$(tsv "$job" "$state" "${JENV[ON_CALENDAR]:--}" "$(retention_summary short)" "${#src[@]} path(s)")")
+  done
+  table "${rows[@]}"
+  printf '\n'
+  note "  Retention: h/d/w/m/y = hourly/daily/weekly/monthly/yearly snapshots kept."
+  if (( hint_install )); then note "  Activate or update jobs with: sudo $PROG install"; fi
+  if (( hint_orphan )); then note "  Clean up timers without config with: sudo $PROG remove <job>"; fi
+  note "  Show one job in full with: sudo $PROG list <job>"
+}
+
+list_job() {
+  local job=$1 dir="$JOBS_DIR/$1" state i delay next
+  local -a src=() exclude=()
+  if [[ ! -d "$dir" ]]; then
+    job_installed "$job" || die "no job '$job'. See all jobs with: sudo $PROG list"
+    warn "job '$job' has an installed timer but no config in $dir"
+    note "Clean it up with: sudo $PROG remove $job"
+    return 1
+  fi
+  state=$(install_state "$job")
+  load_env "$dir/env"
+  load_job_env "$job"
+  load_lines src "$dir/src"
+  load_lines exclude "$dir/exclude"
+  delay=${JENV[RANDOMIZED_DELAY]:-0}
+
+  header "Job '$job'  ($dir)"
+  row "State"           "$state"
+  row "Repository"      "${JENV[RESTIC_REPOSITORY]:--} $(origin RESTIC_REPOSITORY)"
+  row "Password file"   "$(describe_file "${JENV[RESTIC_PASSWORD_FILE]:-}") $(origin RESTIC_PASSWORD_FILE)"
+  row "Schedule"        "${JENV[ON_CALENDAR]:--}$([[ "$delay" == 0 ]] || printf ', random delay up to %s' "$delay")"
+  # Only systemd knows when the installed timer fires next; the env file may
+  # hold a newer schedule that has not been installed yet.
+  next=$(systemctl show -P NextElapseUSecRealtime "$(timer_unit "$job")" 2>/dev/null || true)
+  row "Next run"        "${next:-not scheduled (timer not running)}"
+  row "Retention"       "$(retention_summary long)"
+  row "Prune"           "$(yes_no "${JENV[PRUNE]:-0}")"
+  row "Tags"            "job:$job${JENV[BACKUP_TAGS]:+,${JENV[BACKUP_TAGS]}}"
+  row "One file system" "$(yes_no "${JENV[ONE_FILE_SYSTEM]:-0}")"
+
+  header "Sources  ($dir/src)"
+  for i in "${!src[@]}"; do printf '  %2d  %s\n' "$((i + 1))" "${src[$i]}"; done
+  header "Excludes  ($dir/exclude)"
+  if (( ${#exclude[@]} == 0 )); then info "  (none)"; fi
+  for i in "${!exclude[@]}"; do printf '  %2d  %s\n' "$((i + 1))" "${exclude[$i]}"; done
+  case $state in
+    "needs install") printf '\n'; note "The schedule changed since the last install. Apply it with: sudo $PROG install $job" ;;
+    "not installed"|disabled) printf '\n'; note "Activate it with: sudo $PROG install $job" ;;
+  esac
+}
+
+# ---------------------------------------------------------------------------
+# status: timers and the outcome of the last runs (no root needed)
+# ---------------------------------------------------------------------------
+S_TIMER='' S_LAST='' S_RESULT='' S_NEXT=''
+
+# status_of JOB -> sets S_TIMER, S_LAST, S_RESULT and S_NEXT
+status_of() {
+  local job=$1
+  local -A tp=() sp=()
+  unit_props tp "$(timer_unit "$job")" ActiveState,NextElapseUSecRealtime
+  unit_props sp "$(service_unit "$job")" ActiveState,Result,ExecMainStatus,ExecMainStartTimestamp
+
+  if job_installed "$job"; then
+    S_TIMER=${tp[ActiveState]:-unknown}
+    timer_enabled "$job" || S_TIMER+=", disabled"
+  else
+    S_TIMER="not installed"
+  fi
+  [[ -d "$JOBS_DIR/$job" ]] || S_TIMER+=", no config"
+
+  S_NEXT=${tp[NextElapseUSecRealtime]:-}
+  [[ -n "$S_NEXT" ]] || S_NEXT=-
+
+  # The service's own properties describe the last run since boot. Older runs
+  # are looked up in the journal.
+  if [[ "${sp[ActiveState]:-}" == activating ]]; then
+    S_LAST=${sp[ExecMainStartTimestamp]:--}
+    S_RESULT=running
+  elif [[ -n "${sp[ExecMainStartTimestamp]:-}" ]]; then
+    S_LAST=${sp[ExecMainStartTimestamp]}
+    case ${sp[Result]:-}/${sp[ExecMainStatus]:-} in
+      success/*)   S_RESULT=ok ;;
+      exit-code/3) S_RESULT="partial (exit 3, unreadable files)" ;;
+      exit-code/*) S_RESULT="failed (exit ${sp[ExecMainStatus]:-?})" ;;
+      *)           S_RESULT="failed (${sp[Result]:-unknown})" ;;
+    esac
+  elif journal_last_run "$(service_unit "$job")"; then
+    S_LAST=$LAST_RUN_TIME
+    case $LAST_RUN_RESULT in
+      done)   S_RESULT=ok ;;
+      failed) S_RESULT=failed ;;
+      *)      S_RESULT="failed ($LAST_RUN_RESULT)" ;;
+    esac
+  else
+    S_LAST=-
+    S_RESULT="never run"
+  fi
+}
+
+cmd_status() {
+  local job=${1:-} any_failed=0
+  local -a jobs=() rows=()
+  if [[ -n "$job" ]]; then
+    validate_job_name "$job" || die "invalid job name '$job'"
+    [[ -d "$JOBS_DIR/$job" ]] || job_installed "$job" || die "no job '$job' is configured or installed"
+    systemctl status --no-pager --full --lines=20 "$(timer_unit "$job")" "$(service_unit "$job")" || true
+    status_of "$job"
+    case $S_RESULT in failed*|partial*) return 1 ;; esac
+    return 0
+  fi
+
+  mapfile -t jobs < <(known_jobs)
+  if (( ${#jobs[@]} == 0 )); then
+    info "No jobs are configured or installed. Add one with: sudo $PROG add <job>"
+    return 0
+  fi
+  rows=("$(tsv JOB TIMER "LAST RUN" RESULT "NEXT RUN")")
+  for job in "${jobs[@]}"; do
+    status_of "$job"
+    case $S_RESULT in failed*|partial*) any_failed=1 ;; esac
+    rows+=("$(tsv "$job" "$S_TIMER" "$S_LAST" "$S_RESULT" "$S_NEXT")")
+  done
+  table "${rows[@]}"
+  printf '\n'
+  note "  Details: $PROG status <job>    Logs: $PROG logs <job>"
+  return "$any_failed"
+}
+
+# ---------------------------------------------------------------------------
+# logs: the journal of the backup services
+# ---------------------------------------------------------------------------
+cmd_logs() {
+  local job='' last=0 arg since
+  local -a args=() extra=()
+  if [[ $# -gt 0 && "$1" != -* ]]; then
+    job=$1
+    shift
+    validate_job_name "$job" || die "invalid job name '$job'"
+  fi
+  for arg in "$@"; do
+    if [[ "$arg" == --last ]]; then last=1; else extra+=("$arg"); fi
+  done
+
+  if [[ -n "$job" ]]; then
+    args=(-u "$(service_unit "$job")")
+  else
+    args=(-u "${UNIT_PREFIX}*.service")
+  fi
+
+  if (( last )); then
+    [[ -n "$job" ]] || die "--last needs a job name, e.g. $PROG logs home --last"
+    if (( $(systemd_version) >= 257 )); then
+      args+=(-I)   # the latest invocation of the unit
+    else
+      since=$(systemctl show --timestamp=unix -P ExecMainStartTimestamp "$(service_unit "$job")" 2>/dev/null || true)
+      [[ -n "$since" ]] || die "'$job' has not run since the last boot. See its full history with: $PROG logs $job"
+      args+=(--since "$since")
+    fi
+  elif (( ${#extra[@]} == 0 )); then
+    args+=(-e -n 200)   # open the pager at the newest of the last 200 lines
+  fi
+  exec journalctl "${args[@]}" "${extra[@]}"
+}
+
+# ---------------------------------------------------------------------------
+# remove: deactivate jobs and delete their files (never snapshots)
+# ---------------------------------------------------------------------------
+cmd_remove() {
+  local all=0 purge=0 keep_config=0 yes=0 arg job unit file dir pwfile=''
+  local -a jobs=()
+  for arg in "$@"; do
+    case $arg in
+      --all)         all=1 ;;
+      --purge)       purge=1 ;;
+      --keep-config) keep_config=1 ;;
+      -y|--yes)      yes=1 ;;
+      -*)            die "unknown option '$arg' (see '$PROG help')" ;;
+      *)             validate_job_name "$arg" || die "invalid job name '$arg'"; jobs+=("$arg") ;;
+    esac
+  done
+  if (( all && ${#jobs[@]} > 0 )); then die "name jobs or use --all, not both"; fi
+  if (( ! all && ${#jobs[@]} == 0 )); then die "usage: $PROG remove JOB... | --all  (see '$PROG help')"; fi
+  if (( purge && ! all )); then die "--purge only works together with --all"; fi
+  if (( purge && keep_config )); then die "--purge and --keep-config contradict each other"; fi
+  require_root remove "$@"
+  require_systemd
+
+  if (( all )); then
+    mapfile -t jobs < <(known_jobs)
+  else
+    for job in "${jobs[@]}"; do
+      [[ -d "$JOBS_DIR/$job" ]] || job_installed "$job" || die "no job '$job' is configured or installed"
+    done
+  fi
+  if [[ -f "$GLOBAL_CONFIG" ]]; then
+    load_env "$GLOBAL_CONFIG"
+    pwfile=${CUR[RESTIC_PASSWORD_FILE]:-}
+  fi
+
+  header "This will"
+  if (( ${#jobs[@]} == 0 )); then info "  - remove no jobs, since none are configured or installed"; fi
+  for job in "${jobs[@]}"; do
+    info "  - stop and disable $(timer_unit "$job")"
+    if [[ -d "$(dropin_dir "$job")" ]]; then info "  - delete $(dropin_dir "$job")"; fi
+    if (( ! keep_config )) && [[ -d "$JOBS_DIR/$job" ]]; then info "  - delete $JOBS_DIR/$job"; fi
+  done
+  if (( all )); then
+    info "  - delete the unit templates in $SYSTEMD_DIR and $BIN_PATH"
+    if (( purge )); then
+      info "  - delete $CONFIG_DIR, including the global settings and any password file in it"
+    elif (( keep_config )); then
+      info "  - keep everything in $CONFIG_DIR"
+    else
+      info "  - keep $GLOBAL_CONFIG and the password file"
+    fi
+  elif (( keep_config )); then
+    info "  - keep the job config in $JOBS_DIR"
+  fi
+  note "Snapshots in the repositories are not touched."
+  if (( purge )); then
+    warn "without the repository password, the existing snapshots cannot be restored. Keep a copy somewhere safe."
+  fi
+  if (( ! yes )); then
+    ask_yesno "Proceed?" n || die "nothing removed"
+  fi
+
+  header "Removing"
+  for job in "${jobs[@]}"; do
+    unit=$(timer_unit "$job")
+    if service_running "$job"; then
+      warn "$job: a backup is running now. It will finish, but no new runs will start."
+    fi
+    # Disable needs the template, so jobs go before the templates do.
+    if run_systemctl disable --now --quiet "$unit" 2>/dev/null; then
+      ok "disabled   $unit"
+    else
+      warn "$job: systemctl could not disable $unit, removing its files directly"
+    fi
+    file=$(wants_link "$job")
+    if [[ -L "$file" ]]; then rm -f -- "$file"; ok "deleted    $file"; ANY_CHANGED=1; fi
+    dir=$(dropin_dir "$job")
+    if [[ -d "$dir" ]]; then rm -rf -- "${dir:?}"; ok "deleted    $dir"; ANY_CHANGED=1; fi
+    if (( ! keep_config )) && [[ -d "$JOBS_DIR/$job" ]]; then
+      rm -rf -- "${JOBS_DIR:?}/${job:?}"
+      ok "deleted    $JOBS_DIR/$job"
+    fi
+    run_systemctl reset-failed "$(service_unit "$job")" "$unit" >/dev/null 2>&1 || true
+  done
+
+  if (( all )); then
+    for file in "$SYSTEMD_DIR/${UNIT_PREFIX}.service" "$SYSTEMD_DIR/${UNIT_PREFIX}.timer"; do
+      if [[ -e "$file" ]]; then rm -f -- "$file"; ok "deleted    $file"; ANY_CHANGED=1; fi
+    done
+    if [[ -e "$BIN_PATH" ]]; then rm -f -- "$BIN_PATH"; ok "deleted    $BIN_PATH"; fi
+    if (( purge )) && [[ -d "$CONFIG_DIR" ]]; then
+      rm -rf -- "${CONFIG_DIR:?}"
+      ok "deleted    $CONFIG_DIR"
+      if [[ -n "$pwfile" && -e "$pwfile" ]]; then note "kept $pwfile, since it is outside $CONFIG_DIR"; fi
+    fi
+  fi
+
+  if (( ANY_CHANGED )); then
+    run_systemctl daemon-reload
+    ok "reloaded   systemd units"
+  fi
+  ok "removed ${#jobs[@]} job(s)"
+  if (( ${#jobs[@]} > 0 )); then
+    note "To delete a job's snapshots as well, run restic forget --tag job:<job> --prune against its repository."
+  fi
+}
+
+# ---------------------------------------------------------------------------
+# Dispatcher
+# ---------------------------------------------------------------------------
+usage() {
+  cat <<USAGE
+Usage: $PROG <command> [arguments]
+
+Configuration (stored under ${CONFIG_DIR#"$ROOT"}):
+  init                Create or update the global settings
+  add [JOB]           Create or update one backup job
+  list [JOB]          Show the settings and install state of every job, or of
+                      one job in full
+
+Activation:
+  install [--skip-repo-check] [JOB...]
+                      Install this program and the systemd units, check each
+                      job's repository, and enable one timer per job. Without
+                      JOB names every configured job is installed.
+  remove JOB... [--keep-config] [-y]
+                      Stop and delete the jobs' timers and their config.
+                      With --keep-config the config stays, for a later install.
+  remove --all [--keep-config | --purge] [-y]
+                      Remove every job, the unit templates and the installed
+                      program. Global settings and the password file stay
+                      unless --purge is given. Snapshots are never touched.
+
+Monitoring:
+  status [JOB]        Timer state, last run, result and next run of every job.
+                      With JOB, the full systemctl status of its units.
+                      Exits 1 when a job's last run failed.
+  logs [JOB] [--last] [journalctl options]
+                      The journal of every job, or of one job, opened at the
+                      newest line. --last shows only the most recent run of JOB.
+                      Other options go to journalctl, e.g. -f or --since today.
+
+Running a job now:
+  start JOB [--no-wait]
+                      Run JOB through systemd, exactly as its timer would, and
+                      show its log until it finishes. The run appears in status
+                      and logs, and never overlaps another run of JOB. Ctrl-C
+                      stops following, not the backup. --no-wait returns at once.
+  run JOB             Run JOB directly in this terminal, outside systemd. The
+                      systemd service uses this command itself.
+
+Other:
+  help                Show this help
+  version             Show the version
+
+Every command is safe to re-run. Files are rewritten only when their content
+changes, and systemd is reloaded only when a unit file changed.
+USAGE
+}
+
+main() {
+  local cmd=${1:-help}
+  shift || true
+  case $cmd in
+    init)              cmd_init "$@" ;;
+    add)               cmd_add "$@" ;;
+    list|ls)           cmd_list "$@" ;;
+    install)           cmd_install "$@" ;;
+    remove|rm)         cmd_remove "$@" ;;
+    status)            cmd_status "$@" ;;
+    logs|log)          cmd_logs "$@" ;;
+    start)             cmd_start "$@" ;;
+    run)               cmd_run "$@" ;;
+    help|-h|--help)    usage ;;
+    version|--version) echo "$PROG $VERSION" ;;
+    *)                 die "unknown command '$cmd' (see '$PROG help')" ;;
+  esac
+}
+
+# Run only when executed, so a test can source this file for its functions.
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+  main "$@"
+fi

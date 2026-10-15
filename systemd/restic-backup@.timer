@@ -1,0 +1,14 @@
+# Template timer: one instance per job, e.g. restic-backup@home.timer.
+# The schedule below is only a placeholder. "resticagent install" writes the
+# real one per job into restic-backup@<job>.timer.d/schedule.conf.
+[Unit]
+Description=restic backup timer for job %i
+
+[Timer]
+OnCalendar=daily
+RandomizedDelaySec=15min
+# If the machine was off when the timer should have fired, run at next boot.
+Persistent=true
+
+[Install]
+WantedBy=timers.target
