@@ -1533,6 +1533,225 @@ cmd_snapshots() {
 }
 
 # ---------------------------------------------------------------------------
+# show: the files in one snapshot of a job, through ls -alh or tree
+# ---------------------------------------------------------------------------
+
+# json_unescape TEXT -> TEXT, a JSON string without its quotes, with the
+# escapes undone. printf %b reads \\, \n, \t and \uXXXX like JSON does.
+json_unescape() {
+  local s=$1
+  s=${s//\\\"/\"}
+  s=${s//\\\//\/}
+  printf '%b' "$s"
+}
+
+# json_strings KEY -> the string value of the first KEY in the JSON on stdin,
+# or each string of it when the value is a list, one per line
+json_strings() {
+  local raw item
+  raw=$(grep -oE "\"$1\":(\"([^\"\\\\]|\\\\.)*\"|\[(\"([^\"\\\\]|\\\\.)*\",?)*\])" | head -n 1) || true
+  raw=${raw#"\"$1\":"}
+  while IFS= read -r item; do
+    item=${item#\"}
+    json_unescape "${item%\"}"
+    printf '\n'
+  done < <(grep -oE '"([^"\\]|\\.)*"' <<<"$raw" || true)
+}
+
+# common_dir PATH... -> the deepest directory that holds every PATH, or the
+# PATH itself when there is only one
+common_dir() {
+  local base=$1 p
+  shift
+  for p in "$@"; do
+    while [[ "$p" != "$base" && "$p" != "$base"/* && "$base" != / ]]; do base=$(dirname "$base"); done
+  done
+  printf '%s' "$base"
+}
+
+# tree_input BASE -> turns the output of restic ls --long on stdin into input
+# for tree --fromfile --fflinks: paths relative to BASE, directories ending in
+# "/" and symlinks as "name -> target". The first line is the directory they
+# are relative to: BASE, or its parent when BASE is not a directory.
+# Exits 3 when the input holds no entries.
+tree_input() {
+  SHOW_BASE=$1 awk '
+    function parent(p) { sub(/\/[^\/]*$/, "", p); return p == "" ? "/" : p }
+    BEGIN { base = ENVIRON["SHOW_BASE"] }
+    # mode uid gid size date time path[ -> target]; the header line does not match.
+    match($0, /^[^ ]+ +[0-9]+ +[0-9]+ +[0-9]+ [0-9-]+ [0-9:]+ /) {
+      m = substr($0, 1, 1)
+      p = substr($0, RLENGTH + 1)
+      t = ""
+      if (m == "L" && (k = index(p, " -> ")) > 0) { t = substr(p, k); p = substr(p, 1, k - 1) }
+      if (!n++) {
+        if (p == base && m != "d") base = parent(base)
+        print base
+      }
+      if (p != base) print substr(p, base == "/" ? 2 : length(base) + 2) (m == "d" ? "/" : "") t
+    }
+    END { if (!n) exit 3 }
+  '
+}
+
+# The temporary FUSE mount that show runs ls in, and the restic process behind it
+SHOW_MNT='' SHOW_PID='' SHOW_LOG=''
+
+# show_mount JOB -> mounts the snapshots of JOB with restic mount on a new
+# directory SHOW_MNT, and waits until they can be read
+show_mount() {
+  SHOW_MNT=$(mktemp -d)
+  SHOW_LOG=$(mktemp)
+  trap show_unmount EXIT
+  trap 'exit 130' INT TERM
+  restic mount --no-lock --tag "job:$1" "$SHOW_MNT" >"$SHOW_LOG" 2>&1 &
+  SHOW_PID=$!
+  until [[ -d "$SHOW_MNT/ids" ]]; do
+    if ! kill -0 "$SHOW_PID" 2>/dev/null; then
+      printf "%serror:%s could not mount the snapshots of job '%s' with restic mount\n" "$C_RED" "$C_RESET" "$1" >&2
+      sed 's/^/  /' "$SHOW_LOG" >&2
+      exit 1
+    fi
+    sleep 0.2
+  done
+}
+
+# show_unmount -> stops restic mount, which unmounts, and removes the mount
+# point. Safe to call more than once.
+show_unmount() {
+  if [[ -n "$SHOW_PID" ]]; then
+    kill -INT "$SHOW_PID" 2>/dev/null || true
+    wait "$SHOW_PID" 2>/dev/null || true
+    SHOW_PID=''
+  fi
+  if [[ -n "$SHOW_MNT" ]]; then
+    if mountpoint -q "$SHOW_MNT" 2>/dev/null; then
+      fusermount3 -u "$SHOW_MNT" 2>/dev/null || fusermount -u "$SHOW_MNT" 2>/dev/null || umount "$SHOW_MNT" 2>/dev/null || true
+    fi
+    rmdir "$SHOW_MNT" 2>/dev/null || warn "could not remove the mount point $SHOW_MNT"
+    SHOW_MNT=''
+  fi
+  if [[ -n "$SHOW_LOG" ]]; then rm -f "$SHOW_LOG"; SHOW_LOG=''; fi
+}
+
+cmd_show() {
+  local job='' snap='' path='' mode=list arg json errfile id time host tag found=0 out input base entries dir r shown=0 rc=0
+  local -a roots=() tags=() missing=() tree_args=()
+  for arg in "$@"; do
+    case $arg in
+      --tree) mode=tree ;;
+      -*)     die "unknown option '$arg' (see '$PROG help')" ;;
+      /*)     [[ -z "$path" ]] || die "show takes a single path"; path=$arg ;;
+      *)
+        if [[ -z "$job" ]]; then job=$arg
+        elif [[ -z "$snap" ]]; then snap=$arg
+        else die "usage: $PROG show JOB [SNAPSHOT] [PATH] [--tree]  (see '$PROG help')"
+        fi ;;
+    esac
+  done
+  [[ -n "$job" ]] || die "usage: $PROG show JOB [SNAPSHOT] [PATH] [--tree]  (see '$PROG help')"
+  validate_job_name "$job" || die "invalid job name '$job'"
+  snap=${snap:-latest}
+  [[ "$snap" == latest || "$snap" =~ ^[0-9a-f]{1,64}$ ]] \
+    || die "'$snap' is not a snapshot. Use an ID from '$SUDO$PROG snapshots $job', or latest"
+  require_root show "$@"
+  [[ -f "$JOBS_DIR/$job/env" ]] || die "job '$job' is not configured. Run: $SUDO$PROG add $job"
+  if [[ "$mode" == tree ]]; then
+    command -v tree >/dev/null 2>&1 \
+      || die "--tree needs the tree command. Install it with your package manager (apt, dnf, pacman, zypper)"
+  elif [[ ! -e /dev/fuse ]] || { (( EUID != 0 )) && ! command -v fusermount3 >/dev/null 2>&1 && ! command -v fusermount >/dev/null 2>&1; }; then
+    die "show runs ls on a FUSE mount of the snapshot, and FUSE is not available here. Install fuse3 with your package manager, or use --tree, which does not need it"
+  fi
+  require_restic
+  load_job_env "$job"
+  export_job_env
+
+  # Resolve the snapshot first. restic ignores --tag for an explicit ID, so
+  # the job tag is checked here, and another job's snapshot is refused.
+  errfile=$(mktemp)
+  if [[ "$snap" == latest ]]; then
+    json=$(restic snapshots --no-lock --json --tag "job:$job" latest 2>"$errfile") || rc=$?
+  else
+    json=$(restic snapshots --no-lock --json "$snap" 2>"$errfile") || rc=$?
+  fi
+  id=$(json_strings id <<<"$json")
+  if (( rc != 0 )) || [[ -z "$id" ]]; then
+    if (( rc != 0 )); then
+      printf "%serror:%s could not read the snapshots of job '%s' (restic exit %d)\n" "$C_RED" "$C_RESET" "$job" "$rc" >&2
+    elif [[ "$snap" == latest ]]; then
+      printf "%serror:%s job '%s' has no snapshots yet. Make one with: %s\n" "$C_RED" "$C_RESET" "$job" "$SUDO$PROG start $job" >&2
+      rc=1
+    else
+      printf "%serror:%s no snapshot matches '%s'. See the snapshots of job '%s' with: %s\n" "$C_RED" "$C_RESET" "$snap" "$job" "$SUDO$PROG snapshots $job" >&2
+      rc=1
+    fi
+    sed 's/^/  /' "$errfile" >&2
+    rm -f "$errfile"
+    return "$rc"
+  fi
+  rm -f "$errfile"
+  mapfile -t tags < <(json_strings tags <<<"$json")
+  for tag in "${tags[@]}"; do
+    if [[ "$tag" == "job:$job" ]]; then found=1; fi
+  done
+  (( found )) || die "snapshot ${id:0:8} was not made by job '$job'. See its snapshots with: $SUDO$PROG snapshots $job"
+
+  if [[ -n "$path" ]]; then
+    while [[ "$path" == */ && "$path" != / ]]; do path=${path%/}; done
+    roots=("$path")
+  else
+    mapfile -t roots < <(json_strings paths <<<"$json")
+  fi
+  time=$(json_strings time <<<"$json")
+  host=$(json_strings hostname <<<"$json")
+  header "Snapshot ${id:0:8} of job '$job', made ${time:0:10} ${time:11:5} on $host"
+
+  if [[ "$mode" == tree ]]; then
+    # tree reads the paths from restic ls instead of from a file system.
+    out=$(restic ls --no-lock --long --recursive "$id" "${roots[@]}") || rc=$?
+    if (( rc != 0 )); then
+      printf "%serror:%s could not list snapshot %s (restic exit %d)\n" "$C_RED" "$C_RESET" "${id:0:8}" "$rc" >&2
+      return "$rc"
+    fi
+    input=$(tree_input "$(common_dir "${roots[@]}")" <<<"$out") || rc=$?
+    if (( rc == 3 )); then die "snapshot ${id:0:8} does not contain $(join_by ', ' "${roots[@]}")"; fi
+    base=${input%%$'\n'*}
+    entries=''
+    if [[ "$input" == *$'\n'* ]]; then entries=${input#*$'\n'}; fi
+    tree_args=(--fromfile --fflinks)
+    # tree colors its output only on a terminal, which sed below hides from it.
+    if [[ -t 1 && -n "${LS_COLORS:-}${TREE_COLORS:-}" ]]; then tree_args+=(-C); fi
+    # tree calls the directory it reads "." in its first line; print the real path instead.
+    printf '%s\n' "$base"
+    if [[ -n "$entries" ]]; then printf '%s\n' "$entries"; fi | tree "${tree_args[@]}" . | sed 1d || rc=$?
+    return "$rc"
+  fi
+
+  # ls needs a file system, so the snapshot is mounted for as long as it runs.
+  show_mount "$job"
+  dir="$SHOW_MNT/ids/${id:0:8}"
+  [[ -d "$dir" ]] || die "snapshot ${id:0:8} is missing from the mounted repository"
+  for r in "${roots[@]}"; do
+    if [[ ! -e "$dir$r" && ! -L "$dir$r" ]]; then missing+=("$r"); continue; fi
+    if (( shown )); then printf '\n'; fi
+    shown=1
+    printf '%s:\n' "$r"
+    # ls runs inside the snapshot, so it prints names rather than mount paths.
+    if [[ -d "$dir$r" && ! -L "$dir$r" ]]; then
+      (cd "$dir$r" && ls -alh --color=auto) || rc=$?
+    else
+      (cd "$dir$(dirname "$r")" && ls -alh --color=auto -- "$(basename "$r")") || rc=$?
+    fi
+  done
+  show_unmount
+  if (( ${#missing[@]} > 0 )); then
+    (( shown )) || die "snapshot ${id:0:8} does not contain $(join_by ', ' "${missing[@]}")"
+    warn "snapshot ${id:0:8} does not contain $(join_by ', ' "${missing[@]}")"
+  fi
+  return "$rc"
+}
+
+# ---------------------------------------------------------------------------
 # forget: delete chosen snapshots of one job, after listing them
 # ---------------------------------------------------------------------------
 
@@ -2122,6 +2341,12 @@ Snapshots:
   snapshots JOB [restic snapshots options]
                       List the snapshots of JOB, oldest first. Options go to
                       restic snapshots, e.g. --compact, --latest 5 or --json.
+  show JOB [SNAPSHOT] [PATH] [--tree]
+                      Run ls -alh on a directory in a snapshot of JOB, or tree
+                      on everything below it with --tree. SNAPSHOT is an ID
+                      from snapshots, latest by default. PATH is an absolute
+                      path in the snapshot. Without it, the backed-up paths
+                      are shown. ls runs on a temporary FUSE mount.
   forget JOB --keep-last N | --older-than DURATION | --oldest N
              [--dry-run] [--prune | --no-prune] [-y]
                       List the snapshots of JOB to forget, ask, then forget
@@ -2164,6 +2389,7 @@ main() {
     start)             cmd_start "$@" ;;
     run)               cmd_run "$@" ;;
     snapshots)         cmd_snapshots "$@" ;;
+    show)              cmd_show "$@" ;;
     forget)            cmd_forget "$@" ;;
     help|-h|--help)    usage ;;
     version|--version) echo "$PROG $VERSION" ;;

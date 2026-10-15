@@ -20,15 +20,16 @@ resticagent status             # what ran, how it went, what runs next
 - **Retention that stays in its lane.** Every snapshot is tagged `job:<name>`, so old snapshots are forgotten per job, even when several jobs share a repository.
 - **Monitoring built in.** `status` shows the last result and next run of every job and exits non-zero after a failure. `logs` opens the journal of a job or of its latest run.
 - **Run on demand.** `start` runs a job through systemd right now and streams its log, without ever overlapping a scheduled run.
-- **Snapshots per job.** `snapshots` lists a job's snapshots. `forget` deletes its oldest ones, or all but its newest, and lists exactly which ones go before asking.
+- **Snapshots per job.** `snapshots` lists a job's snapshots, and `show` shows what is in one with `ls -alh` or `tree`. `forget` deletes its oldest ones, or all but its newest, and lists exactly which ones go before asking.
 - **Clean removal.** `remove` deactivates and deletes jobs. It never touches the snapshots in a repository.
-- **No extra dependencies.** It needs bash, systemd and restic, nothing else.
+- **No extra dependencies.** It needs bash, systemd and restic. Only `show` needs more: FUSE for its `ls` listing, and `tree` for `--tree`.
 
 ## Requirements
 
 - Linux with systemd, including `systemctl`, `journalctl` and `systemd-analyze`
 - Bash 4.4 or newer
 - restic 0.17 or newer
+- For `show` only: FUSE (the `fuse3` package) to list a snapshot with `ls`, and the `tree` command for `show --tree`
 - Standard coreutils, diffutils and sed, which every mainstream distribution ships
 - Root access only for system-wide backups, see [Your backups or the system's](#your-backups-or-the-systems)
 
@@ -105,6 +106,7 @@ Things to know about your own jobs:
 | `status [JOB]` | Show timer state, last run, result and next run |
 | `logs [JOB]` | Show the journal of all jobs or one job |
 | `snapshots JOB` | List a job's snapshots |
+| `show JOB [SNAPSHOT] [PATH]` | Show the files in a snapshot with `ls -alh`, or with `tree` given `--tree` |
 | `forget JOB` | Forget a job's snapshots by count or age, after listing them |
 | `remove JOB...` | Deactivate and delete jobs, or everything with `--all` |
 

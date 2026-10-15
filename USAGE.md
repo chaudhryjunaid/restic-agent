@@ -7,7 +7,7 @@ This guide covers every command, the configuration files, restoring data and tro
 - [Running backups](#running-backups): schedules, `start`, `run`
 - [Monitoring](#monitoring): `status`, `logs`, `list`
 - [Changing a job](#changing-a-job)
-- [Snapshots](#snapshots): `snapshots`, `forget`
+- [Snapshots](#snapshots): `snapshots`, `show`, `forget`
 - [Removing jobs](#removing-jobs): `remove`
 - [Restoring files](#restoring-files)
 - [File reference](#file-reference)
@@ -312,7 +312,35 @@ resticagent snapshots home --json
 - **Other options go to `restic snapshots` unchanged.** Useful ones are `--compact` to leave out the paths, `--latest N` for the newest N of each host and set of paths, `--host`, `--path`, `--group-by host` and `--json`.
 - **It takes no repository lock,** so it works while a backup or prune is running.
 
-The IDs in the list work with restic directly, for example to restore one snapshot. See [Restoring files](#restoring-files).
+The IDs in the list work with `show` and with restic directly, for example to restore one snapshot. See [Restoring files](#restoring-files).
+
+### `resticagent show JOB [SNAPSHOT] [PATH] [--tree]`
+
+Shows what is in a snapshot of a job, without restoring anything.
+
+```sh
+resticagent show home                              # the backed-up directories, in the latest snapshot
+resticagent show home 3f988623                     # the same, in snapshot 3f988623
+resticagent show home /home/me/Documents           # one directory, in the latest snapshot
+resticagent show home 3f988623 /home/me/Documents  # one directory, in snapshot 3f988623
+resticagent show home /home/me/Documents --tree    # everything below it, with tree
+```
+
+```text
+Snapshot 3f988623 of job 'home', made 2026-10-15 02:00 on laptop
+/home/me/Documents:
+total 3.0M
+drwxr-xr-x 2 me me    0 Oct 14 18:20 .
+drwxr-xr-x 2 me me    0 Oct 14 18:20 ..
+-rw-r--r-- 1 me me  12K Oct  2 09:41 budget.ods
+drwxr-xr-x 2 me me    0 Sep 30 11:05 letters
+-rw-r--r-- 1 me me 2.9M Oct 14 18:20 scan.pdf
+```
+
+- **SNAPSHOT is an ID** from `resticagent snapshots`, or a unique beginning of one. Without it, the job's latest snapshot is used. A snapshot of another job is refused, even when they share the repository.
+- **PATH is an absolute path** as it was on the backed-up machine. It can be a directory or a file. Without it, every path the snapshot backed up is shown, one section each.
+- **The listing is `ls -alh` itself.** `show` mounts the job's snapshots with `restic mount` on a temporary directory, runs `ls` inside the snapshot, and unmounts again, also after Ctrl-C. This needs FUSE: the `fuse3` package, which most desktop systems have. Owners are named after this host's users and groups. Directories show a size of 0, since restic does not record one.
+- **`--tree` runs `tree`** on the paths that `restic ls` lists, using `tree --fromfile`, so it needs the `tree` command but no FUSE. The first line is the shown path, or the deepest directory holding all backed-up paths. On a large snapshot, give a PATH or pipe the tree into `less`.
 
 ### `resticagent forget JOB ...`
 
@@ -368,7 +396,7 @@ restic restore latest --tag job:home --target /tmp/restore
 restic restore latest --tag job:home --target /tmp/restore --include /home/me/Documents
 ```
 
-`resticagent snapshots home` shows the same list as the `restic snapshots` line, without loading anything. `set -a` exports every variable the files define, so restic finds the repository, the password file and any credentials. Restore into a separate directory first, then copy back what you need. For a system-wide job, start with `sudo -i` and load the files in `/etc/resticagent` instead.
+`resticagent snapshots home` shows the same list as the `restic snapshots` line, without loading anything, and `resticagent show home` replaces `restic ls`, to find the paths for `--include`. `set -a` exports every variable the files define, so restic finds the repository, the password file and any credentials. Restore into a separate directory first, then copy back what you need. For a system-wide job, start with `sudo -i` and load the files in `/etc/resticagent` instead.
 
 To browse snapshots like a folder, use `restic mount /mnt/restic`. This needs FUSE.
 
