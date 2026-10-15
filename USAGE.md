@@ -3,7 +3,7 @@
 This guide covers every command, the configuration files, restoring data and troubleshooting. For an overview and installation, see the [README](README.md).
 
 - [Concepts](#concepts)
-- [Setting up](#setting-up): `init`, `add`, `install`
+- [Setting up](#setting-up): `init`, `add`, `import`, `install`
 - [Running backups](#running-backups): schedules, `start`, `run`
 - [Monitoring](#monitoring): `status`, `logs`, `list`
 - [Changing a job](#changing-a-job)
@@ -70,11 +70,72 @@ How the prompts behave:
 - **At least one retention rule is required.** A job without one would keep every snapshot forever.
 - **Lists are entered one item per line.** An empty line ends the list. When a job already has entries, they are listed first and you can keep them or enter new ones.
 - **Re-running `add` for an existing job pre-fills every prompt** with the current value. In a terminal you can edit the value in place, and clearing an optional value unsets it.
+- **Defaults are only offered for a new job.** In an existing job, a rule you left empty stays empty when you accept the prompt.
 - **Before writing, `add` shows a summary** and asks for confirmation.
 
 Source paths must be absolute. A path that does not exist on this machine is accepted with a warning, which helps when preparing a job for a new host.
 
 Exclude patterns use restic's syntax, for example `**/node_modules`, `**/.cache`, `*.tmp` or `/home/*/.local/share/Trash`.
+
+### `resticagent import FILE [JOB] [--global] [-y]`
+
+Creates or replaces one job from an env file, without prompts. On a host that has no global settings yet, the same file creates those too. A new machine can then be set up with one file and two commands:
+
+```sh
+sudo ./bin/resticagent import home.env
+sudo ./bin/resticagent install
+```
+
+An example file:
+
+```sh
+# home.env: this laptop's home directory, backed up to the NAS
+JOB=home
+RESTIC_REPOSITORY=sftp:backup@nas.local:/srv/restic
+RESTIC_PASSWORD=correct-horse-battery-staple
+ON_CALENDAR=*-*-* 02:00:00
+RANDOMIZED_DELAY=30min
+KEEP_DAILY=7
+KEEP_WEEKLY=4
+KEEP_MONTHLY=6
+SRC=/home/me, /etc
+EXCLUDE=**/node_modules, **/.cache, *.tmp
+```
+
+The file format:
+
+- **One `KEY=VALUE` per line.** Blank lines and lines starting with `#` are ignored, and an `export ` prefix is allowed.
+- **Nothing is interpreted.** One pair of single or double quotes around a value is removed. There are no variables, escapes or comments after a value. The file is read, never executed.
+- **Values can't contain a single quote or a backslash,** the same rule as for all settings.
+- **`SRC` and `EXCLUDE` hold comma-separated lists.** Spaces around each item are removed, so a path may contain spaces but not commas.
+- **A key that appears twice** takes its later value, with a warning.
+
+The job's name is the `JOB` argument, else the `JOB` key in the file, else the file name without `.env`. So `import web.env` creates the job `web`.
+
+Where each key goes:
+
+| Keys | Written to |
+| --- | --- |
+| `SRC` and `EXCLUDE` | the job's `src` and `exclude` files, one item per line |
+| `ON_CALENDAR`, `RANDOMIZED_DELAY`, the `KEEP_*` rules, `BACKUP_TAGS`, `ONE_FILE_SYSTEM`, `PRUNE` | the job's `env` file |
+| `RESTIC_PASSWORD` | the password file, only if it doesn't exist yet |
+| every other key, such as `RESTIC_REPOSITORY`, `RESTIC_PASSWORD_FILE` or backend credentials | the global settings, or an override for this job, as described below |
+
+How restic settings and credentials are stored:
+
+- **On a host without global settings,** they create `/etc/resticagent/config`. The file must then set `RESTIC_REPOSITORY`. A missing `RESTIC_PASSWORD_FILE`, `RESTIC_CACHE_DIR` or `RESTIC_COMPRESSION` gets the same default as in `init`.
+- **On a host with global settings,** a value equal to the global one is skipped. A different value is stored in the job's `env` file and applies to this job only. Importing one job therefore never changes another.
+- **With `--global`,** a different value updates the global settings instead, which affects every job.
+
+Job keys the file leaves out get the same defaults as a new job in `add`. Those are a daily schedule, a random delay of up to 15 minutes, the job name as its tag, and staying on one file system with pruning on. The retention defaults of 7 daily, 4 weekly, 6 monthly and 1 yearly snapshot apply only when the file has no `KEEP_*` key at all. `ONE_FILE_SYSTEM` and `PRUNE` accept `1` or `0`, as well as `yes`, `no`, `true`, `false`, `on` and `off`.
+
+`RESTIC_PASSWORD` is written to the job's password file with mode 0600, and never to a settings file. If the password file already exists and holds a different password, `import` stops. Overwriting it would lock you out of an existing repository, so change a repository's password with `restic key passwd` instead. Without `RESTIC_PASSWORD`, `import` offers to create a missing password file when run in a terminal, and only warns when run with `-y`.
+
+`import` checks the whole file before writing anything, the same way the `add` prompts check answers, and lists every problem at once. Problems are reported by line number or key name, never with the value, since values can be secrets. When the file is clean, `import` shows a summary and asks for confirmation. Add `-y` to skip the question in scripts.
+
+The file describes the whole job. Settings it leaves out fall back to the defaults rather than keeping the job's earlier values. Importing the same file again changes nothing. A job created by `import` can be edited with `add` and the other way round, and `add` keeps the overrides that `import` stored.
+
+Keep the file private, for example with `chmod 600 home.env`, because it can hold the repository password and credentials. Don't commit it to a public repository.
 
 ### `resticagent install [--skip-repo-check] [JOB...]`
 
@@ -218,6 +279,7 @@ Retention uses short forms: `7d 4w 6m 1y` means 7 daily, 4 weekly, 6 monthly and
 ## Changing a job
 
 - **Re-run `add`** for the job. Every prompt starts from the current value.
+- **Or edit your import file and import it again.** The job is replaced by what the file says.
 - **Or edit the files directly.** Keep the `KEY='VALUE'` format described in the [File reference](#file-reference).
 - **After changing the schedule, run `install`.** `list` shows `needs install` until you do. Other changes take effect at the next run.
 - **To change global settings,** run `init` again.
@@ -293,6 +355,8 @@ All files are plain text. Values are written as `KEY='VALUE'`, one per line, and
 | `PRUNE` | `1` to prune unreferenced data after forgetting | `1` |
 
 Omit a key to leave it unset. At least one `KEEP_*` key is required.
+
+Any other key is passed to restic for this job only, on top of the global settings. `import` stores a value here when it differs from the global one, for example credentials for a job's own repository. `list <job>` shows these keys by name.
 
 When restic has fewer snapshots than a rule asks for, it may keep an extra older snapshot to fill the rule. New jobs therefore keep a few more snapshots than the numbers suggest until enough history exists.
 

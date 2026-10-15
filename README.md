@@ -13,6 +13,7 @@ resticagent status                  # what ran, how it went, what runs next
 ## Features
 
 - **Interactive setup.** Prompts check each answer as soon as you enter it. Schedules are checked by systemd itself, and the next run time is shown.
+- **Or import a file.** `import` sets up a job, and on a new host the global settings too, from one env file, so a machine can be configured without any prompts.
 - **Idempotent.** Re-running a command pre-fills the current values, rewrites only files whose content changed, and reloads systemd only when a unit changed.
 - **One timer per job.** A single systemd template unit serves every job, and each job's schedule lives in its own small drop-in file.
 - **Retention that stays in its lane.** Every snapshot is tagged `job:<name>`, so old snapshots are forgotten per job, even when several jobs share a repository.
@@ -48,6 +49,12 @@ It was developed on Ubuntu 26.04 with systemd 259 and restic 0.18.1. Older syste
    sudo ./bin/resticagent add home
    ```
 
+   If you keep the settings in a file, import it instead. See [USAGE.md](USAGE.md#resticagent-import-file-job---global--y) for the format.
+
+   ```sh
+   sudo ./bin/resticagent import home.env
+   ```
+
 4. Install and activate it. This copies `resticagent` to `/usr/local/bin`, checks the repository, offers to initialize it if it doesn't exist yet, and enables the job's timer:
 
    ```sh
@@ -67,6 +74,7 @@ It was developed on Ubuntu 26.04 with systemd 259 and restic 0.18.1. Older syste
 | --- | --- | --- |
 | `init` | Create or update the global settings | yes |
 | `add [JOB]` | Create or update a backup job | yes |
+| `import FILE [JOB]` | Create or replace a job from an env file, without prompts | yes |
 | `list [JOB]` | Show every job's settings and install state, or one job in full | yes |
 | `install [JOB...]` | Install the program and units, check repositories, enable timers | yes |
 | `start JOB` | Run a job now through systemd and follow its log | yes |

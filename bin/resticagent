@@ -21,7 +21,7 @@
 
 set -euo pipefail
 
-VERSION="0.4.0"
+VERSION="0.5.0"
 ROOT="${RESTICAGENT_ROOT:-}"
 ROOT=${ROOT%/}
 CONFIG_DIR="$ROOT/etc/resticagent"
@@ -34,6 +34,10 @@ UNIT_PREFIX="restic-backup@"
 # that install relies on, and --retry-lock (0.16) is used by run.
 MIN_RESTIC_MINOR=17
 KEEP_RULES=(last hourly daily weekly monthly yearly within)
+# The keys of a job's env file that "add" asks about, besides the repository
+# and password file overrides, in the order they are written.
+JOB_KEYS=(ON_CALENDAR RANDOMIZED_DELAY KEEP_LAST KEEP_HOURLY KEEP_DAILY KEEP_WEEKLY
+          KEEP_MONTHLY KEEP_YEARLY KEEP_WITHIN BACKUP_TAGS ONE_FILE_SYSTEM PRUNE)
 # Message IDs systemd logs when a start job ends: successfully, or failed.
 MSG_UNIT_STARTED=39f53479d3a045ac8e11786248231fbf
 MSG_UNIT_FAILED=be02cf6855d2428ba40df7e9d022f03d
@@ -334,6 +338,96 @@ ensure_password_file() {
 }
 
 # ---------------------------------------------------------------------------
+# Writers shared by init, add and import, so every path produces the same files
+# ---------------------------------------------------------------------------
+
+# job_managed_key KEY -> true for the job keys that "add" asks about
+job_managed_key() {
+  case " RESTIC_REPOSITORY RESTIC_PASSWORD_FILE ${JOB_KEYS[*]} " in
+    *" $1 "*) return 0 ;;
+  esac
+  return 1
+}
+
+# sorted_keys ARRAY KEY... -> sets ARRAY to the KEYs, sorted
+sorted_keys() {
+  local -n _sk=$1
+  shift
+  _sk=()
+  if (( $# > 0 )); then mapfile -t _sk < <(printf '%s\n' "$@" | sort); fi
+}
+
+# join_by SEPARATOR ITEM... -> the ITEMs joined by SEPARATOR
+join_by() {
+  local sep=$1 out='' item
+  shift
+  for item in "$@"; do out+="${out:+$sep}$item"; done
+  printf '%s' "$out"
+}
+
+# write_global_config ARRAY -> writes /etc/resticagent/config from ARRAY
+write_global_config() {
+  local -n _wg=$1
+  local key
+  local -a extra=() names=()
+  for key in "${!_wg[@]}"; do
+    case $key in
+      RESTIC_REPOSITORY|RESTIC_PASSWORD_FILE|RESTIC_CACHE_DIR|RESTIC_COMPRESSION) ;;
+      *) names+=("$key") ;;
+    esac
+  done
+  sorted_keys extra "${names[@]}"
+  mkdir -p "$CONFIG_DIR"
+  write_file "$GLOBAL_CONFIG" 0600 < <(
+    printf '# resticagent global settings. Change them with "%s init" or "%s import --global".\n' "$PROG" "$PROG"
+    printf '# Read by "%s run" before each job'"'"'s own env file.\n' "$PROG"
+    for key in RESTIC_REPOSITORY RESTIC_PASSWORD_FILE RESTIC_CACHE_DIR RESTIC_COMPRESSION "${extra[@]}"; do
+      env_line "$key" "${_wg[$key]:-}"
+    done
+  )
+}
+
+# write_job_env JOB ARRAY -> writes config.d/JOB/env from ARRAY: the repository
+# overrides, the job settings, then any other variables, in a fixed order
+write_job_env() {
+  local job=$1 key
+  local -n _wj=$2
+  local -a extra=() names=()
+  for key in "${!_wj[@]}"; do
+    job_managed_key "$key" || names+=("$key")
+  done
+  sorted_keys extra "${names[@]}"
+  mkdir -p "$JOBS_DIR/$job"
+  write_file "$JOBS_DIR/$job/env" 0600 < <(
+    printf "# resticagent job '%s'. Change it with \"%s add %s\" or \"%s import\".\n" "$job" "$PROG" "$job" "$PROG"
+    printf '# Read by "%s run %s" after %s.\n' "$PROG" "$job" "${GLOBAL_CONFIG#"$ROOT"}"
+    for key in RESTIC_REPOSITORY RESTIC_PASSWORD_FILE "${JOB_KEYS[@]}" "${extra[@]}"; do
+      env_line "$key" "${_wj[$key]:-}"
+    done
+  )
+}
+
+# write_job_lists JOB SRC_ARRAY EXCLUDE_ARRAY -> writes config.d/JOB/{src,exclude}
+write_job_lists() {
+  local job=$1
+  local -n _wl_src=$2 _wl_exclude=$3
+  # src is read with --files-from-verbatim: paths only, no comments.
+  write_file "$JOBS_DIR/$job/src" 0644 < <(printf '%s\n' "${_wl_src[@]}")
+  write_file "$JOBS_DIR/$job/exclude" 0644 < <(
+    printf "# Exclude patterns for resticagent job '%s' (restic --exclude-file syntax).\n" "$job"
+    if (( ${#_wl_exclude[@]} > 0 )); then printf '%s\n' "${_wl_exclude[@]}"; fi
+  )
+}
+
+install_hint() {
+  if [[ -f "$SYSTEMD_DIR/$(timer_unit "$1").d/schedule.conf" ]]; then
+    note "Apply the changes to its timer with: sudo $PROG install $1"
+  else
+    note "Activate it with: sudo $PROG install $1"
+  fi
+}
+
+# ---------------------------------------------------------------------------
 # restic and systemd helpers
 # ---------------------------------------------------------------------------
 require_restic() {
@@ -497,16 +591,14 @@ cmd_init() {
     validate_key_value
 
   header "Writing"
-  mkdir -p "$CONFIG_DIR"
-  write_file "$GLOBAL_CONFIG" 0600 < <(
-    printf '# resticagent global settings. Re-run "%s init" to change.\n' "$PROG"
-    printf '# Read by "%s run" before each job'"'"'s own env file.\n' "$PROG"
-    env_line RESTIC_REPOSITORY "$repo"
-    env_line RESTIC_PASSWORD_FILE "$pwfile"
-    env_line RESTIC_CACHE_DIR "$cache"
-    env_line RESTIC_COMPRESSION "$compression"
-    for kv in "${extras[@]}"; do env_line "${kv%%=*}" "${kv#*=}"; done
+  local -A settings=(
+    [RESTIC_REPOSITORY]=$repo [RESTIC_PASSWORD_FILE]=$pwfile
+    [RESTIC_CACHE_DIR]=$cache [RESTIC_COMPRESSION]=$compression
   )
+  # settings is passed by name to write_global_config.
+  # shellcheck disable=SC2034
+  for kv in "${extras[@]}"; do settings[${kv%%=*}]=${kv#*=}; done
+  write_global_config settings
   ensure_password_file "$pwfile"
 }
 
@@ -540,10 +632,17 @@ cmd_add() {
   ask repo   "Repository override"    "${CUR[RESTIC_REPOSITORY]:-}"    validate_value
   ask pwfile "Password file override" "${CUR[RESTIC_PASSWORD_FILE]:-}" validate_abs_path_or_empty
 
+  # Defaults only apply to a new job. In an existing job an empty value was a
+  # deliberate choice, such as a retention rule that was left out.
+  local d_delay=15min d_daily=7 d_weekly=4 d_monthly=6 d_yearly=1 d_tags=$job
+  if [[ -f "$job_dir/env" ]]; then
+    d_delay='' d_daily='' d_weekly='' d_monthly='' d_yearly='' d_tags=''
+  fi
+
   header "Schedule"
   local on_calendar delay
   ask on_calendar "When to run (systemd OnCalendar: daily, hourly, 'Mon..Fri 18:00', '*-*-* 02:00:00')" "${CUR[ON_CALENDAR]:-daily}" validate_calendar
-  ask delay       "Random delay before each run (0, 30min, 1h)" "${CUR[RANDOMIZED_DELAY]:-15min}" validate_timespan
+  ask delay       "Random delay before each run (0, 30min, 1h)" "${CUR[RANDOMIZED_DELAY]:-$d_delay}" validate_timespan
 
   header "Retention  (which snapshots to keep)"
   note "Leave a rule empty to skip it. At least one rule is required."
@@ -551,10 +650,10 @@ cmd_add() {
   while true; do
     ask keep_last    "Keep the N most recent snapshots"       "${CUR[KEEP_LAST]:-}"     validate_int_or_empty
     ask keep_hourly  "Keep N hourly snapshots"                "${CUR[KEEP_HOURLY]:-}"   validate_int_or_empty
-    ask keep_daily   "Keep N daily snapshots"                 "${CUR[KEEP_DAILY]:-7}"   validate_int_or_empty
-    ask keep_weekly  "Keep N weekly snapshots"                "${CUR[KEEP_WEEKLY]:-4}"  validate_int_or_empty
-    ask keep_monthly "Keep N monthly snapshots"               "${CUR[KEEP_MONTHLY]:-6}" validate_int_or_empty
-    ask keep_yearly  "Keep N yearly snapshots"                "${CUR[KEEP_YEARLY]:-1}"  validate_int_or_empty
+    ask keep_daily   "Keep N daily snapshots"                 "${CUR[KEEP_DAILY]:-$d_daily}"     validate_int_or_empty
+    ask keep_weekly  "Keep N weekly snapshots"                "${CUR[KEEP_WEEKLY]:-$d_weekly}"   validate_int_or_empty
+    ask keep_monthly "Keep N monthly snapshots"               "${CUR[KEEP_MONTHLY]:-$d_monthly}" validate_int_or_empty
+    ask keep_yearly  "Keep N yearly snapshots"                "${CUR[KEEP_YEARLY]:-$d_yearly}"   validate_int_or_empty
     ask keep_within  "Keep every snapshot newer than (30d, 1y6m)" "${CUR[KEEP_WITHIN]:-}" validate_restic_duration_or_empty
     [[ -n "$keep_last$keep_hourly$keep_daily$keep_weekly$keep_monthly$keep_yearly$keep_within" ]] && break
     warn "restic forget needs at least one keep rule"
@@ -564,7 +663,7 @@ cmd_add() {
 
   header "Backup options"
   local tags one_fs
-  ask tags "Tags, comma separated" "${CUR[BACKUP_TAGS]:-$job}" validate_value
+  ask tags "Tags, comma separated" "${CUR[BACKUP_TAGS]:-$d_tags}" validate_value
   if ask_yesno "Stay on one file system (skip other mounts below the source paths)?" "$(yn_default "${CUR[ONE_FILE_SYSTEM]:-1}")"; then one_fs=1; else one_fs=0; fi
 
   header "Source paths  ($job_dir/src)"
@@ -603,38 +702,300 @@ cmd_add() {
   ask_yesno "Write this configuration?" y || die "nothing written"
 
   header "Writing"
-  mkdir -p "$job_dir"
-  write_file "$job_dir/env" 0600 < <(
-    printf "# resticagent job '%s'. Re-run \"%s add %s\" to change.\n" "$job" "$PROG" "$job"
-    printf '# Read by "%s run %s" after %s.\n' "$PROG" "$job" "${GLOBAL_CONFIG#"$ROOT"}"
-    env_line RESTIC_REPOSITORY    "$repo"
-    env_line RESTIC_PASSWORD_FILE "$pwfile"
-    env_line ON_CALENDAR          "$on_calendar"
-    env_line RANDOMIZED_DELAY     "$delay"
-    env_line KEEP_LAST            "$keep_last"
-    env_line KEEP_HOURLY          "$keep_hourly"
-    env_line KEEP_DAILY           "$keep_daily"
-    env_line KEEP_WEEKLY          "$keep_weekly"
-    env_line KEEP_MONTHLY         "$keep_monthly"
-    env_line KEEP_YEARLY          "$keep_yearly"
-    env_line KEEP_WITHIN          "$keep_within"
-    env_line BACKUP_TAGS          "$tags"
-    env_line ONE_FILE_SYSTEM      "$one_fs"
-    env_line PRUNE                "$prune"
+  local key
+  local -A values=(
+    [RESTIC_REPOSITORY]=$repo [RESTIC_PASSWORD_FILE]=$pwfile
+    [ON_CALENDAR]=$on_calendar [RANDOMIZED_DELAY]=$delay
+    [KEEP_LAST]=$keep_last [KEEP_HOURLY]=$keep_hourly [KEEP_DAILY]=$keep_daily
+    [KEEP_WEEKLY]=$keep_weekly [KEEP_MONTHLY]=$keep_monthly [KEEP_YEARLY]=$keep_yearly
+    [KEEP_WITHIN]=$keep_within [BACKUP_TAGS]=$tags [ONE_FILE_SYSTEM]=$one_fs [PRUNE]=$prune
   )
-  # src is read with --files-from-verbatim: paths only, no comments.
-  write_file "$job_dir/src" 0644 < <(printf '%s\n' "${src[@]}")
-  write_file "$job_dir/exclude" 0644 < <(
-    printf "# Exclude patterns for resticagent job '%s' (restic --exclude-file syntax).\n" "$job"
-    if (( ${#exclude[@]} > 0 )); then printf '%s\n' "${exclude[@]}"; fi
-  )
+  # Keep variables that add does not ask about, such as overrides from import.
+  for key in "${!CUR[@]}"; do
+    [[ -n "${values[$key]+set}" ]] || values[$key]=${CUR[$key]}
+  done
+  write_job_env "$job" values
+  write_job_lists "$job" src exclude
   ensure_password_file "$pwfile"
   ok "job '$job' configured"
-  if [[ -f "$SYSTEMD_DIR/$(timer_unit "$job").d/schedule.conf" ]]; then
-    note "Apply the changes to its timer with: sudo $PROG install $job"
-  else
-    note "Activate it with: sudo $PROG install $job"
+  install_hint "$job"
+}
+
+# ---------------------------------------------------------------------------
+# import: a job, and on a new host the global settings, from one env file
+# ---------------------------------------------------------------------------
+declare -A MASTER=()
+
+# parse_master_file FILE -> MASTER[KEY]=VALUE for each KEY=VALUE line. The file
+# is parsed, never sourced. Blank lines and lines starting with # are skipped,
+# an "export " prefix is allowed, and one pair of surrounding quotes is removed.
+# Problems are reported by line number only, since values may be secrets.
+parse_master_file() {
+  local file=$1 line key value n=0 bad=0
+  local re_skip='^[[:space:]]*(#|$)'
+  local re_pair='^[[:space:]]*(export[[:space:]]+)?([A-Za-z_][A-Za-z0-9_]*)=(.*)$'
+  local re_squote="^'(.*)'\$" re_dquote='^"(.*)"$'
+  MASTER=()
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    n=$(( n + 1 ))
+    line=${line%$'\r'}
+    if [[ "$line" =~ $re_skip ]]; then continue; fi
+    if [[ ! "$line" =~ $re_pair ]]; then
+      warn "$file line $n is not KEY=VALUE"
+      bad=1
+      continue
+    fi
+    key=${BASH_REMATCH[2]}
+    value=${BASH_REMATCH[3]}
+    value=${value%"${value##*[![:space:]]}"}
+    if [[ "$value" =~ $re_squote || "$value" =~ $re_dquote ]]; then value=${BASH_REMATCH[1]}; fi
+    if [[ -n "${MASTER[$key]+set}" ]]; then warn "$file line $n sets $key again, the later value wins"; fi
+    MASTER[$key]=$value
+  done <"$file"
+  return "$bad"
+}
+
+# split_list ARRAY VALUE -> the comma-separated items of VALUE, trimmed,
+# without empty ones
+split_list() {
+  local -n _sl=$1
+  local _sl_item
+  local -a _sl_parts=()
+  _sl=()
+  IFS=',' read -r -a _sl_parts <<<"$2"
+  for _sl_item in "${_sl_parts[@]}"; do
+    _sl_item=${_sl_item#"${_sl_item%%[![:space:]]*}"}
+    _sl_item=${_sl_item%"${_sl_item##*[![:space:]]}"}
+    if [[ -n "$_sl_item" ]]; then _sl+=("$_sl_item"); fi
+  done
+}
+
+# normalize_bool VALUE -> prints 1 or 0; fails for anything that isn't a yes or no
+normalize_bool() {
+  case ${1,,} in
+    1|yes|y|true|on)  echo 1 ;;
+    0|no|n|false|off) echo 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+# import_check KEY VALUE VALIDATOR HINT -> 0 if VALIDATOR accepts VALUE,
+# otherwise prints "KEY: HINT" and returns 1
+import_check() {
+  if "$3" "$2" >/dev/null 2>&1; then return 0; fi
+  warn "$1: $4"
+  return 1
+}
+
+cmd_import() {
+  local file='' job='' to_global=0 yes=0 arg key rule item value bad=0 global_exists=0 any_keep=0
+  local password='' has_password=0 repo pwfile label keep_summary
+  local -a src=() exclude=() changed_global=() overrides=() names=()
+  local -A jw=() newg=()
+  for arg in "$@"; do
+    case $arg in
+      --global) to_global=1 ;;
+      -y|--yes) yes=1 ;;
+      -*)       die "unknown option '$arg' (see '$PROG help')" ;;
+      *)
+        if [[ -z "$file" ]]; then file=$arg
+        elif [[ -z "$job" ]]; then job=$arg
+        else die "import takes one FILE and an optional JOB name"
+        fi
+        ;;
+    esac
+  done
+  [[ -n "$file" ]] || die "usage: $PROG import FILE [JOB] [--global] [-y]"
+  [[ -f "$file" && -r "$file" ]] || die "cannot read $file"
+  require_root import "$@"
+  # Malformed lines are reported, and checking goes on, so every problem in
+  # the file shows up in one pass.
+  parse_master_file "$file" || bad=1
+
+  # The job name: the JOB argument, else JOB= in the file, else the file name.
+  if [[ -z "$job" ]]; then job=${MASTER[JOB]:-}; fi
+  if [[ -z "$job" ]]; then job=$(basename -- "$file"); job=${job%.env}; fi
+  validate_job_name "$job" || die "invalid job name '$job'. Name the job explicitly: $PROG import '$file' <job>"
+
+  split_list src "${MASTER[SRC]:-}"
+  split_list exclude "${MASTER[EXCLUDE]:-}"
+  if [[ -n "${MASTER[RESTIC_PASSWORD]+set}" ]]; then
+    has_password=1
+    password=${MASTER[RESTIC_PASSWORD]}
   fi
+  unset 'MASTER[JOB]' 'MASTER[SRC]' 'MASTER[EXCLUDE]' 'MASTER[RESTIC_PASSWORD]'
+
+  # Job settings, with the same defaults as "add".
+  jw[ON_CALENDAR]=${MASTER[ON_CALENDAR]:-daily}
+  jw[RANDOMIZED_DELAY]=${MASTER[RANDOMIZED_DELAY]:-15min}
+  for rule in "${KEEP_RULES[@]}"; do
+    key="KEEP_${rule^^}"
+    if [[ -n "${MASTER[$key]:-}" ]]; then
+      jw[$key]=${MASTER[$key]}
+      any_keep=1
+    fi
+  done
+  if (( ! any_keep )); then
+    jw[KEEP_DAILY]=7
+    jw[KEEP_WEEKLY]=4
+    jw[KEEP_MONTHLY]=6
+    jw[KEEP_YEARLY]=1
+  fi
+  jw[BACKUP_TAGS]=${MASTER[BACKUP_TAGS]:-$job}
+  for key in ONE_FILE_SYSTEM PRUNE; do
+    if value=$(normalize_bool "${MASTER[$key]:-1}"); then
+      jw[$key]=$value
+    else
+      warn "$key: use 1 or 0 (yes, no, true and false work too)"
+      bad=1
+    fi
+  done
+  for key in "${JOB_KEYS[@]}"; do unset "MASTER[$key]"; done
+
+  # Everything left is for restic: repository, password file, credentials.
+  for key in "${!MASTER[@]}"; do
+    if [[ "$key" == KEEP_* ]]; then
+      warn "$key is not a retention rule. Use KEEP_LAST, KEEP_HOURLY, KEEP_DAILY, KEEP_WEEKLY, KEEP_MONTHLY, KEEP_YEARLY or KEEP_WITHIN"
+      bad=1
+    elif [[ -z "${MASTER[$key]}" ]]; then
+      unset "MASTER[$key]"
+    else
+      import_check "$key" "${MASTER[$key]}" validate_value "single quotes and backslashes are not allowed" || bad=1
+    fi
+  done
+
+  import_check ON_CALENDAR "${jw[ON_CALENDAR]}" validate_calendar \
+    "systemd rejects '${jw[ON_CALENDAR]}'. Examples: daily, hourly, 'Mon..Fri 18:00'" || bad=1
+  import_check RANDOMIZED_DELAY "${jw[RANDOMIZED_DELAY]}" validate_timespan \
+    "systemd rejects '${jw[RANDOMIZED_DELAY]}'. Examples: 0, 30min, 1h" || bad=1
+  for rule in "${KEEP_RULES[@]}"; do
+    key="KEEP_${rule^^}"
+    [[ -n "${jw[$key]:-}" ]] || continue
+    if [[ "$rule" == within ]]; then
+      import_check "$key" "${jw[$key]}" validate_restic_duration_or_empty "use a restic duration such as 30d or 1y6m" || bad=1
+    else
+      import_check "$key" "${jw[$key]}" validate_int_or_empty "use a whole number" || bad=1
+    fi
+  done
+  import_check BACKUP_TAGS "${jw[BACKUP_TAGS]}" validate_value "single quotes and backslashes are not allowed" || bad=1
+  [[ -z "${MASTER[RESTIC_PASSWORD_FILE]:-}" ]] \
+    || import_check RESTIC_PASSWORD_FILE "${MASTER[RESTIC_PASSWORD_FILE]}" validate_abs_path "use an absolute path" || bad=1
+  [[ -z "${MASTER[RESTIC_CACHE_DIR]:-}" ]] \
+    || import_check RESTIC_CACHE_DIR "${MASTER[RESTIC_CACHE_DIR]}" validate_abs_path "use an absolute path" || bad=1
+  [[ -z "${MASTER[RESTIC_COMPRESSION]:-}" ]] \
+    || import_check RESTIC_COMPRESSION "${MASTER[RESTIC_COMPRESSION]}" validate_compression "use auto, off or max" || bad=1
+
+  if (( ${#src[@]} == 0 )); then
+    warn "SRC: list at least one path to back up, separated by commas"
+    bad=1
+  fi
+  for item in "${src[@]}"; do
+    import_check SRC "$item" validate_abs_path "'$item' must be an absolute path without quotes or backslashes" || bad=1
+    [[ "$item" != /* || -e "$item" ]] || warn "SRC: $item does not exist on this host (kept anyway)"
+  done
+  for item in "${exclude[@]}"; do
+    import_check EXCLUDE "$item" validate_value "'$item' has a single quote or backslash" || bad=1
+  done
+
+  # On a new host the restic settings become the global settings. Once those
+  # exist, a differing value only overrides them for this job, so importing
+  # one job never changes the others. --global updates the global settings.
+  CUR=()
+  if [[ -f "$GLOBAL_CONFIG" ]]; then
+    global_exists=1
+    load_env "$GLOBAL_CONFIG"
+  fi
+  for key in "${!CUR[@]}"; do newg[$key]=${CUR[$key]}; done
+  for key in "${!MASTER[@]}"; do
+    if [[ "${CUR[$key]-}" == "${MASTER[$key]}" ]]; then
+      continue
+    elif (( ! global_exists || to_global )); then
+      newg[$key]=${MASTER[$key]}
+      changed_global+=("$key")
+    else
+      jw[$key]=${MASTER[$key]}
+      overrides+=("$key")
+    fi
+  done
+  if (( ! global_exists )); then
+    if [[ -z "${newg[RESTIC_REPOSITORY]:-}" ]]; then
+      warn "RESTIC_REPOSITORY: this host has no global settings yet, so the file must name the repository"
+      bad=1
+    fi
+    newg[RESTIC_PASSWORD_FILE]=${newg[RESTIC_PASSWORD_FILE]:-$CONFIG_DIR/password}
+    newg[RESTIC_CACHE_DIR]=${newg[RESTIC_CACHE_DIR]:-/var/cache/restic}
+    newg[RESTIC_COMPRESSION]=${newg[RESTIC_COMPRESSION]:-auto}
+  fi
+  repo=${jw[RESTIC_REPOSITORY]:-${newg[RESTIC_REPOSITORY]:-}}
+  pwfile=${jw[RESTIC_PASSWORD_FILE]:-${newg[RESTIC_PASSWORD_FILE]:-}}
+
+  if (( has_password )); then
+    if [[ -z "$password" ]]; then
+      warn "RESTIC_PASSWORD is empty"
+      bad=1
+    elif [[ -e "$pwfile" && "$(<"$pwfile")" != "$password" ]]; then
+      warn "RESTIC_PASSWORD differs from the password in $pwfile, and that file is never overwritten."
+      warn "Change a repository's password with 'restic key passwd', then update the file."
+      bad=1
+    fi
+  fi
+  (( bad == 0 )) || die "nothing imported. Fix the problems above in $file"
+
+  # Summary
+  JENV=()
+  for key in "${!jw[@]}"; do JENV[$key]=${jw[$key]}; done
+  keep_summary=$(retention_summary long)
+  header "Import  ($file)"
+  if [[ -d "$JOBS_DIR/$job" ]]; then label="$job (exists, its settings will be replaced)"; else label="$job (new)"; fi
+  row "Job" "$label"
+  if [[ -n "${jw[RESTIC_REPOSITORY]:-}" ]]; then label="$repo (job)"; else label="$repo (global)"; fi
+  row "Repository" "$label"
+  label=$pwfile
+  if (( has_password )) && [[ ! -e "$pwfile" ]]; then label+=" (will be created from RESTIC_PASSWORD)"; fi
+  row "Password file" "$label"
+  label=${jw[ON_CALENDAR]}
+  if [[ "${jw[RANDOMIZED_DELAY]}" != 0 ]]; then label+=" (+ up to ${jw[RANDOMIZED_DELAY]})"; fi
+  row "Schedule" "$label"
+  row "Keep" "$keep_summary"
+  row "Prune" "$(yes_no "${jw[PRUNE]:-0}")"
+  row "Tags" "job:$job,${jw[BACKUP_TAGS]}"
+  row "One file system" "$(yes_no "${jw[ONE_FILE_SYSTEM]:-0}")"
+  row "Sources" "$(join_by ', ' "${src[@]}")"
+  if (( ${#exclude[@]} > 0 )); then row "Excludes" "$(join_by ', ' "${exclude[@]}")"; else row "Excludes" "none"; fi
+  if (( ! global_exists )); then
+    row "Global settings" "will be created in $GLOBAL_CONFIG"
+  elif (( ${#changed_global[@]} > 0 )); then
+    sorted_keys names "${changed_global[@]}"
+    row "Global settings" "${names[*]} will change for every job"
+  fi
+  if (( ${#overrides[@]} > 0 )); then
+    sorted_keys names "${overrides[@]}"
+    row "Job overrides" "${names[*]}, since they differ from the global settings"
+    note "  To change the global settings instead, add --global."
+  fi
+  if (( ! yes )); then
+    ask_yesno "Write this configuration?" y || die "nothing written"
+  fi
+
+  header "Writing"
+  if (( ! global_exists || ${#changed_global[@]} > 0 )); then write_global_config newg; fi
+  write_job_env "$job" jw
+  write_job_lists "$job" src exclude
+  if (( has_password )) && [[ ! -e "$pwfile" ]]; then
+    mkdir -p "$(dirname "$pwfile")"
+    (umask 077 && printf '%s\n' "$password" >"$pwfile")
+    ok "created    $pwfile (mode 0600)"
+  elif (( has_password )); then
+    info "  unchanged  $pwfile"
+  elif [[ ! -e "$pwfile" ]]; then
+    if (( yes )) || [[ ! -t 0 ]]; then
+      warn "password file $pwfile does not exist. Create it (mode 0600), or add RESTIC_PASSWORD to $file, before installing."
+    else
+      ensure_password_file "$pwfile"
+    fi
+  fi
+  ok "job '$job' imported"
+  install_hint "$job"
 }
 
 # ---------------------------------------------------------------------------
@@ -1198,8 +1559,8 @@ cmd_list() {
 }
 
 list_job() {
-  local job=$1 dir="$JOBS_DIR/$1" state i delay next
-  local -a src=() exclude=()
+  local job=$1 dir="$JOBS_DIR/$1" state i delay next key
+  local -a src=() exclude=() names=() extra=()
   if [[ ! -d "$dir" ]]; then
     job_installed "$job" || die "no job '$job'. See all jobs with: sudo $PROG list"
     warn "job '$job' has an installed timer but no config in $dir"
@@ -1226,6 +1587,13 @@ list_job() {
   row "Prune"           "$(yes_no "${JENV[PRUNE]:-0}")"
   row "Tags"            "job:$job${JENV[BACKUP_TAGS]:+,${JENV[BACKUP_TAGS]}}"
   row "One file system" "$(yes_no "${JENV[ONE_FILE_SYSTEM]:-0}")"
+  for key in "${!CUR[@]}"; do
+    job_managed_key "$key" || names+=("$key")
+  done
+  if (( ${#names[@]} > 0 )); then
+    sorted_keys extra "${names[@]}"
+    row "Other variables" "${extra[*]} (this job only, values hidden)"
+  fi
 
   header "Sources  ($dir/src)"
   for i in "${!src[@]}"; do printf '  %2d  %s\n' "$((i + 1))" "${src[$i]}"; done
@@ -1469,6 +1837,10 @@ Usage: $PROG <command> [arguments]
 Configuration (stored under ${CONFIG_DIR#"$ROOT"}):
   init                Create or update the global settings
   add [JOB]           Create or update one backup job
+  import FILE [JOB] [--global] [-y]
+                      Create or replace one job from an env file instead of
+                      prompts. SRC= and EXCLUDE= hold comma-separated lists.
+                      On a new host it also creates the global settings.
   list [JOB]          Show the settings and install state of every job, or of
                       one job in full
 
@@ -1518,6 +1890,7 @@ main() {
   case $cmd in
     init)              cmd_init "$@" ;;
     add)               cmd_add "$@" ;;
+    import)            cmd_import "$@" ;;
     list|ls)           cmd_list "$@" ;;
     install)           cmd_install "$@" ;;
     remove|rm)         cmd_remove "$@" ;;
