@@ -33,7 +33,7 @@
 
 set -euo pipefail
 
-VERSION="0.7.0"
+VERSION="0.8.0"
 ROOT="${RESTICAGENT_ROOT:-}"
 ROOT=${ROOT%/}
 UNIT_PREFIX="restic-backup@"
@@ -45,6 +45,8 @@ MIN_RESTIC_MINOR=17
 KEEP_RULES=(last hourly daily weekly monthly yearly within)
 # Failure alert settings, kept in the global settings; a job's env may override them.
 NOTIFY_KEYS=(NOTIFY_DESKTOP NOTIFY_MAIL)
+# Repository check settings, in the global settings as well
+CHECK_KEYS=(CHECK_EVERY CHECK_READ_DATA)
 # The keys of a job's env file that "add" asks about, besides the repository
 # and password file overrides, in the order they are written.
 JOB_KEYS=(ON_CALENDAR RANDOMIZED_DELAY KEEP_LAST KEEP_HOURLY KEEP_DAILY KEEP_WEEKLY
@@ -108,6 +110,10 @@ set_scope() {
   JOBS_DIR="$CONFIG_DIR/config.d"
   # The installed program's data, e.g. ~/.local/share/resticagent next to ~/.local/bin
   SHARE_DIR="${BIN_PATH%/bin/resticagent}/share/resticagent"
+  # What resticagent records between runs, such as when repositories were checked
+  if [[ "$SCOPE" == system ]]; then STATE_DIR="$ROOT/var/lib/resticagent"
+  else STATE_DIR="$ROOT${XDG_STATE_HOME:-$HOME/.local/state}/resticagent"
+  fi
 }
 
 if (( EUID == 0 )); then set_scope system; else set_scope user; fi
@@ -259,6 +265,20 @@ validate_int_or_empty() {
 
 validate_restic_duration_or_empty() {
   [[ -z "$1" || "$1" =~ ^([0-9]+[ymdh])+$ ]] || { warn "use restic durations such as 30d, 2m or 1y6m, or leave empty"; return 1; }
+}
+
+validate_days() {
+  [[ "$1" =~ ^[0-9]+$ ]] || { warn "enter a whole number of days, 0 for never"; return 1; }
+}
+
+# validate_read_data_or_empty VALUE -> a share of the data such as 5% or 100%
+validate_read_data_or_empty() {
+  [[ -z "$1" ]] && return 0
+  if [[ "$1" =~ ^[0-9]+(\.[0-9]+)?%$ ]] && awk -v v="${1%\%}" 'BEGIN { exit !(v > 0 && v <= 100) }'; then
+    return 0
+  fi
+  warn "enter a share of the data such as 5% or 100%, or leave empty"
+  return 1
 }
 
 validate_desktop_mode() {
@@ -440,7 +460,7 @@ write_global_config() {
   local -a extra=() names=()
   for key in "${!_wg[@]}"; do
     case $key in
-      RESTIC_REPOSITORY|RESTIC_PASSWORD_FILE|RESTIC_CACHE_DIR|RESTIC_COMPRESSION|NOTIFY_*) ;;
+      RESTIC_REPOSITORY|RESTIC_PASSWORD_FILE|RESTIC_CACHE_DIR|RESTIC_COMPRESSION|NOTIFY_*|CHECK_*) ;;
       *) names+=("$key") ;;
     esac
   done
@@ -449,7 +469,7 @@ write_global_config() {
   write_file "$GLOBAL_CONFIG" 0600 < <(
     printf '# resticagent global settings. Change them with "%s init" or "%s import --global".\n' "$PROG" "$PROG"
     printf '# Read by "%s run" before each job'"'"'s own env file.\n' "$PROG"
-    for key in RESTIC_REPOSITORY RESTIC_PASSWORD_FILE RESTIC_CACHE_DIR RESTIC_COMPRESSION "${NOTIFY_KEYS[@]}" "${extra[@]}"; do
+    for key in RESTIC_REPOSITORY RESTIC_PASSWORD_FILE RESTIC_CACHE_DIR RESTIC_COMPRESSION "${NOTIFY_KEYS[@]}" "${CHECK_KEYS[@]}" "${extra[@]}"; do
       env_line "$key" "${_wg[$key]:-}"
     done
   )
@@ -643,11 +663,11 @@ cmd_init() {
   require_root init
   load_env "$GLOBAL_CONFIG"
 
-  local repo pwfile cache compression key kv desktop mail
+  local repo pwfile cache compression key kv desktop mail check_every check_read
   local -a extras=()
   for key in "${!CUR[@]}"; do
     case $key in
-      RESTIC_REPOSITORY|RESTIC_PASSWORD_FILE|RESTIC_CACHE_DIR|RESTIC_COMPRESSION|NOTIFY_*) ;;
+      RESTIC_REPOSITORY|RESTIC_PASSWORD_FILE|RESTIC_CACHE_DIR|RESTIC_COMPRESSION|NOTIFY_*|CHECK_*) ;;
       *) extras+=("$key=${CUR[$key]}") ;;
     esac
   done
@@ -672,6 +692,14 @@ cmd_init() {
     warn "this machine has no sendmail, so no mail goes out until a mail transfer agent such as postfix or msmtp-mta is installed"
   fi
 
+  header "Repository checks"
+  note "After a backup, resticagent checks its repository for errors, at most every few days."
+  ask check_every "Check each repository every how many days (0: never)" "${CUR[CHECK_EVERY]:-7}" validate_days
+  check_read=''
+  if (( check_every > 0 )); then
+    ask check_read "Share of the stored data to read in each check, e.g. 5% (empty: none)" "${CUR[CHECK_READ_DATA]:-}" validate_read_data_or_empty
+  fi
+
   header "Additional environment variables"
   ask_list extras "Backend credentials and other restic settings, as KEY=VALUE (optional)." \
     "Examples: AWS_ACCESS_KEY_ID=..., AWS_SECRET_ACCESS_KEY=..., B2_ACCOUNT_ID=..., RESTIC_PACK_SIZE=64" \
@@ -682,6 +710,7 @@ cmd_init() {
     [RESTIC_REPOSITORY]=$repo [RESTIC_PASSWORD_FILE]=$pwfile
     [RESTIC_CACHE_DIR]=$cache [RESTIC_COMPRESSION]=$compression
     [NOTIFY_DESKTOP]=$desktop [NOTIFY_MAIL]=$mail
+    [CHECK_EVERY]=$check_every [CHECK_READ_DATA]=$check_read
   )
   # settings is passed by name to write_global_config.
   # shellcheck disable=SC2034
@@ -994,6 +1023,9 @@ cmd_import() {
       bad=1
     fi
   fi
+  [[ -z "${MASTER[CHECK_EVERY]:-}" ]] \
+    || import_check CHECK_EVERY "${MASTER[CHECK_EVERY]}" validate_days "use a whole number of days, 0 for never" || bad=1
+  import_check CHECK_READ_DATA "${MASTER[CHECK_READ_DATA]:-}" validate_read_data_or_empty "use a share such as 5% or 100%" || bad=1
 
   if (( ${#src[@]} == 0 )); then
     warn "SRC: list at least one path to back up, separated by commas"
@@ -1593,9 +1625,22 @@ cmd_run() {
       return "$forget_rc"
     fi
   fi
+  # The scheduled check of the repository, at most every CHECK_EVERY days. The
+  # date is kept per repository, so of the jobs sharing one, only one checks.
+  local every=${JENV[CHECK_EVERY]:-7} checked='' check_rc=0
+  if [[ "$every" =~ ^[0-9]+$ ]] && (( every > 0 )) && repo_check_due "${JENV[RESTIC_REPOSITORY]:-}" "$every"; then
+    info "==> check of the repository, due every $every day(s)${JENV[CHECK_READ_DATA]:+, reading ${JENV[CHECK_READ_DATA]} of the data}"
+    repo_check_run "${JENV[CHECK_READ_DATA]:-}" || check_rc=$?
+    if (( check_rc != 0 )); then
+      # notify looks for this line to tell a failed check from a failed backup.
+      printf 'error: the repository check failed (restic exit %d)\n' "$check_rc" >&2
+      return "$check_rc"
+    fi
+    checked=", and the repository check passed"
+  fi
   # Exit 3 ends as a failed unit, whose alert says the backup is incomplete.
   if (( notify && rc == 0 )); then
-    run_notice success "Backup '$job' finished" "Done in $(elapsed $(( SECONDS - started )))"
+    run_notice success "Backup '$job' finished" "Done in $(elapsed $(( SECONDS - started )))$checked"
   fi
   return "$rc"
 }
@@ -1757,7 +1802,11 @@ The mail about a real failure also holds the last lines of the backup's log."
       done
     fi
     last=$(grep -v '^[[:space:]]*$' <<<"$lines" | tail -n 1 || true)
-    if [[ "$result" == exit-code && "$status" == 3 ]]; then
+    if grep -q 'error: the repository check failed' <<<"$lines"; then
+      kind=failure
+      summary="Repository check for '$job' on $host failed"
+      body="The backup was saved, but the check of its repository at $when found a problem (exit $status)."
+    elif [[ "$result" == exit-code && "$status" == 3 ]]; then
       kind=incomplete
       summary="Backup '$job' on $host is incomplete"
       body="Some files could not be read (restic exit 3), so the snapshot of $when lacks them."
@@ -2560,9 +2609,10 @@ cmd_list() {
     row "Cache"         "${CUR[RESTIC_CACHE_DIR]:--}"
     row "Compression"   "${CUR[RESTIC_COMPRESSION]:--}"
     row "Failure alerts" "$(alerts_summary)"
+    row "Repository check" "$(check_summary "${CUR[CHECK_EVERY]:-}" "${CUR[CHECK_READ_DATA]:-}" "${CUR[RESTIC_REPOSITORY]:-}")"
     for key in "${!CUR[@]}"; do
       case $key in
-        RESTIC_REPOSITORY|RESTIC_PASSWORD_FILE|RESTIC_CACHE_DIR|RESTIC_COMPRESSION|NOTIFY_*) ;;
+        RESTIC_REPOSITORY|RESTIC_PASSWORD_FILE|RESTIC_CACHE_DIR|RESTIC_COMPRESSION|NOTIFY_*|CHECK_*) ;;
         *) others+=("$key") ;;
       esac
     done
@@ -2632,6 +2682,7 @@ list_job() {
   row "Next run"        "${next:-not scheduled (timer not running)}"
   row "Retention"       "$(retention_summary long)"
   row "Prune"           "$(yes_no "${JENV[PRUNE]:-0}")"
+  row "Repository check" "$(check_summary "${JENV[CHECK_EVERY]:-}" "${JENV[CHECK_READ_DATA]:-}" "${JENV[RESTIC_REPOSITORY]:-}")"
   row "Tags"            "job:$job${JENV[BACKUP_TAGS]:+,${JENV[BACKUP_TAGS]}}"
   row "One file system" "$(yes_no "${JENV[ONE_FILE_SYSTEM]:-0}")"
   for key in "${!CUR[@]}"; do
@@ -2884,6 +2935,148 @@ cmd_remove() {
   if (( ${#jobs[@]} > 0 )); then
     note "To delete a job's snapshots as well, run restic forget --tag job:<job> --prune against its repository."
   fi
+}
+
+# ---------------------------------------------------------------------------
+# check: verify a repository, by hand or every few days after a backup
+# ---------------------------------------------------------------------------
+
+# repo_check_stamp REPO -> the file holding when REPO last passed a check. It is
+# named by a hash, since a repository address can hold a password.
+repo_check_stamp() { printf '%s/checked-%s' "$STATE_DIR" "$(printf '%s' "$1" | sha256sum | cut -c1-16)"; }
+
+# repo_check_last REPO -> when REPO last passed a check, in seconds since 1970
+repo_check_last() {
+  local stamp line=''
+  stamp=$(repo_check_stamp "$1")
+  [[ -f "$stamp" ]] && IFS= read -r line <"$stamp"
+  if [[ "$line" =~ ^[0-9]+$ ]]; then printf '%s' "$line"; fi
+}
+
+# repo_check_due REPO DAYS -> true when REPO's last passed check is DAYS days old
+repo_check_due() {
+  local last
+  last=$(repo_check_last "$1")
+  [[ -z "$last" ]] || (( $(date +%s) - last >= $2 * 86400 ))
+}
+
+# repo_check_run READ_DATA -> restic check of the repository in the
+# environment, also reading READ_DATA (such as 5%) of its data. A pass is
+# recorded, so the next scheduled check waits.
+repo_check_run() {
+  local rc=0 stamp
+  local -a args=(check --retry-lock 30m)
+  if [[ "${1:-}" == 100% ]]; then args+=(--read-data)
+  elif [[ -n "${1:-}" ]]; then args+=(--read-data-subset "$1")
+  fi
+  restic "${args[@]}" || rc=$?
+  if (( rc == 0 )); then
+    stamp=$(repo_check_stamp "$RESTIC_REPOSITORY")
+    mkdir -p "$STATE_DIR"
+    date +%s >"$stamp"
+  fi
+  return "$rc"
+}
+
+# check_summary EVERY READ_DATA REPO -> the check settings, and REPO's last pass
+check_summary() {
+  local every=${1:-7} last text
+  if [[ "$every" == 0 ]]; then printf 'never'; return; fi
+  text="every $every day(s)${2:+, reading $2 of the data}"
+  last=$(repo_check_last "$3")
+  if [[ -n "$last" ]]; then text+=", last passed $(date -d "@$last" '+%Y-%m-%d %H:%M')"
+  else text+=", not checked yet"
+  fi
+  printf '%s' "$text"
+}
+
+cmd_check() {
+  local arg read='' job repo rc=0 r
+  local -a orig=("$@") jobs=() order=()
+  local -A first=() users=()
+  while (( $# > 0 )); do
+    arg=$1
+    shift
+    if [[ "$arg" == --*=* ]]; then set -- "${arg#*=}" "$@"; arg=${arg%%=*}; fi
+    case $arg in
+      --read-data)
+        if [[ -z "${1:-}" ]] || ! validate_read_data_or_empty "$1" 2>/dev/null; then
+          die "--read-data needs a share of the data, such as 5% or 100%"
+        fi
+        read=$1
+        shift ;;
+      -*) die "unknown option '$arg' (see '$PROG help')" ;;
+      *)  validate_job_name "$arg" || die "invalid job name '$arg'"; jobs+=("$arg") ;;
+    esac
+  done
+  require_root check "${orig[@]}"
+  if (( ${#jobs[@]} == 0 )); then mapfile -t jobs < <(list_jobs); fi
+  if (( ${#jobs[@]} == 0 )); then
+    info "No jobs are configured. Add one with: $SUDO$PROG add <job>"
+    return 0
+  fi
+  for job in "${jobs[@]}"; do
+    [[ -f "$JOBS_DIR/$job/env" ]] || die "job '$job' is not configured. Run: $SUDO$PROG add $job"
+  done
+  require_restic
+  # One check per repository, with the settings of its first job.
+  for job in "${jobs[@]}"; do
+    load_job_env "$job"
+    repo=${JENV[RESTIC_REPOSITORY]:-}
+    [[ -n "$repo" ]] || die "job '$job' has no repository"
+    if [[ -z "${first[$repo]:-}" ]]; then first[$repo]=$job; order+=("$repo"); fi
+    users[$repo]+="${users[$repo]:+, }$job"
+  done
+  for repo in "${order[@]}"; do
+    header "Repository $repo  (job: ${users[$repo]})"
+    r=0
+    # A subshell, so one job's credentials never reach another's restic.
+    ( load_job_env "${first[$repo]}"; export_job_env; repo_check_run "$read" ) || r=$?
+    if (( r == 0 )); then
+      ok "no errors in $repo"
+    else
+      printf "%serror:%s the check of %s failed (restic exit %d)\n" "$C_RED" "$C_RESET" "$repo" "$r" >&2
+      rc=$r
+    fi
+  done
+  return "$rc"
+}
+
+# ---------------------------------------------------------------------------
+# find: which snapshots of a job hold a file
+# ---------------------------------------------------------------------------
+cmd_find() {
+  local job=${1:-} arg out json=0 rc=0
+  [[ -n "$job" && "$job" != -* ]] || die "usage: $PROG find JOB PATTERN... [restic find options]  (see '$PROG help')"
+  shift
+  validate_job_name "$job" || die "invalid job name '$job'"
+  (( $# > 0 )) || die "usage: $PROG find JOB PATTERN... [restic find options]  (see '$PROG help')"
+  for arg in "$@"; do
+    case $arg in
+      # restic ORs repeated --tag filters, which would let in other jobs.
+      --tag|--tag=*) die "find searches only the snapshots tagged job:$job, so --tag cannot be used" ;;
+      --json)        json=1 ;;
+    esac
+  done
+  require_root find "$job" "$@"
+  [[ -f "$JOBS_DIR/$job/env" ]] || die "job '$job' is not configured. Run: $SUDO$PROG add $job"
+  require_restic
+  load_job_env "$job"
+  export_job_env
+  if (( ! json )); then header "Snapshots of job '$job' with matching files, newest first"; fi
+  out=$(restic find --no-lock --tag "job:$job" "$@") || rc=$?
+  if (( rc != 0 )); then
+    printf '%s\n' "$out"
+    printf "%serror:%s could not search the snapshots of job '%s' (restic exit %d)\n" "$C_RED" "$C_RESET" "$job" "$rc" >&2
+    return "$rc"
+  fi
+  # restic prints nothing at all when nothing matches.
+  if [[ -z "$out" ]]; then
+    (( json )) || info "No file in the snapshots of job '$job' matches."
+    return 0
+  fi
+  printf '%s\n' "$out"
+  if (( ! json )); then note "Restore one with: $SUDO$PROG restore $job SNAPSHOT PATH"; fi
 }
 
 # ---------------------------------------------------------------------------
@@ -3336,6 +3529,9 @@ Snapshots:
                       from snapshots, latest by default. PATH is an absolute
                       path in the snapshot. Without it, the backed-up paths
                       are shown. ls runs on a temporary FUSE mount.
+  find JOB PATTERN... [restic find options]
+                      Which snapshots of JOB hold files matching PATTERN, a
+                      name or a path with * and ?, e.g. '*.pdf'. -i ignores case.
   diff JOB [SNAPSHOT [SNAPSHOT]] [--metadata]
                       What changed between two snapshots of JOB: by default
                       the latest and the one before it from the same host.
@@ -3362,6 +3558,11 @@ Snapshots:
                       --dry-run only lists them.
 
 Repository:
+  check [JOB...] [--read-data PERCENT]
+                      Check the repositories of every job, or of the given
+                      jobs, once each, for errors. --read-data also reads that
+                      share of the stored data, e.g. 5% or 100%. Runs do this
+                      every CHECK_EVERY days (7 by default) after a backup.
   unlock JOB [--remove-all] [-y]
                       Remove stale locks, left by restic commands that ended
                       without cleaning up. --remove-all removes every lock.
@@ -3405,6 +3606,8 @@ main() {
     show)              cmd_show "$@" ;;
     restore)           cmd_restore "$@" ;;
     diff)              cmd_diff "$@" ;;
+    find)              cmd_find "$@" ;;
+    check)             cmd_check "$@" ;;
     mount)             cmd_mount "$@" ;;
     stats)             cmd_stats "$@" ;;
     pause)             cmd_pause "$@" ;;

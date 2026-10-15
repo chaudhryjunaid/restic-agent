@@ -22,6 +22,7 @@ resticagent status             # what ran, how it went, what runs next
 - **Notifications.** Desktop notifications say when a scheduled backup starts (🔄), succeeds (✅) or fails (❌). A failure also mails the local account the job belongs to: yours, or root's for system-wide jobs.
 - **Run on demand.** `start` runs a job through systemd right now and streams its log, without ever overlapping a scheduled run.
 - **Snapshots per job.** `snapshots` lists a job's snapshots, and `show` shows what is in one with `ls -alh` or `tree`. `forget` deletes its oldest ones, or all but its newest, and lists exactly which ones go before asking.
+- **Repository checks.** After a backup, its repository is checked for errors every 7 days, optionally reading a share of the stored data. A failed check alerts you like a failed backup.
 - **Restore with a preview.** `restore` puts files back in place or into another folder. It shows first what it would overwrite or delete, and asks.
 - **Clean removal.** `remove` deactivates and deletes jobs. It never touches the snapshots in a repository.
 - **One-step install, no root.** `setup.sh` installs it into `~/.local`, together with restic and tree if this machine lacks them, and removes it all again with `--uninstall`.
@@ -133,12 +134,14 @@ Things to know about your own jobs:
 | `notify [JOB] --test` | Send a test failure alert. A failed run sends a real one through systemd. |
 | `snapshots JOB` | List a job's snapshots |
 | `show JOB [SNAPSHOT] [PATH]` | Show the files in a snapshot with `ls -alh`, or with `tree` given `--tree` |
+| `find JOB PATTERN...` | Find which snapshots hold a file |
 | `diff JOB [SNAPSHOT [SNAPSHOT]]` | Show what changed between two snapshots, by default the last two |
 | `mount JOB [DIR]` | Browse a job's snapshots as folders, until Ctrl-C |
 | `restore JOB [SNAPSHOT] [PATH]` | Restore files in place, or below `--target DIR`, after previewing the changes |
 | `forget JOB` | Forget a job's snapshots by count or age, after listing them |
 | `pause JOB...`, `resume JOB...` | Stop jobs' timers for a while, and start them again |
 | `remove JOB...` | Deactivate and delete jobs, or everything with `--all` |
+| `check [JOB...]` | Check the jobs' repositories for errors, optionally reading their data |
 | `unlock JOB` | Remove stale locks from a job's repository |
 | `key [JOB]` | Change the repository password, and the password file with it |
 

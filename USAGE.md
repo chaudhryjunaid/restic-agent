@@ -7,10 +7,10 @@ This guide covers every command, the configuration files, restoring data and tro
 - [Running backups](#running-backups): schedules, `start`, `run`
 - [Monitoring](#monitoring): notifications with `notify`, `status`, `logs`, `list`, `stats`
 - [Changing a job](#changing-a-job): pausing with `pause` and `resume`
-- [Snapshots](#snapshots): `snapshots`, `show`, `diff`, `mount`, `forget`
+- [Snapshots](#snapshots): `snapshots`, `show`, `find`, `diff`, `mount`, `forget`
 - [Removing jobs](#removing-jobs): `remove`
 - [Restoring files](#restoring-files): `restore`
-- [The repository](#the-repository): `unlock`, `key`
+- [The repository](#the-repository): `check`, `unlock`, `key`
 - [File reference](#file-reference)
 - [Exit codes](#exit-codes)
 - [Troubleshooting](#troubleshooting)
@@ -38,6 +38,8 @@ Creates or updates the global settings. `add` runs it automatically the first ti
 | Compression (`auto`, `off`, `max`) | `auto` | `RESTIC_COMPRESSION` |
 | Desktop notifications: `all` (start, success, failure), `failures` or `off` | `all` | `NOTIFY_DESKTOP` |
 | Mail failure alerts to the local account | yes | `NOTIFY_MAIL` |
+| Check each repository every how many days (`0`: never) | `7` | `CHECK_EVERY` |
+| Share of the stored data to read in each check, like `5%` | none | `CHECK_READ_DATA` |
 | Additional environment variables | none | one `KEY=VALUE` per line |
 
 The repository can be any location restic supports, for example `/mnt/backup/restic`, `sftp:backup@nas.local:/srv/restic`, `s3:s3.amazonaws.com/my-bucket/restic` or `rest:https://backup.example.com/`.
@@ -217,8 +219,9 @@ What a run does:
 1. It reads `~/.config/resticagent/config`, then the job's `env`, so job values override global ones.
 2. It runs `restic backup` with the job's `src` and `exclude` files, its tags, and `--one-file-system` if enabled.
 3. If the backup succeeded, or saved a snapshot with some unreadable files, it runs `restic forget` with the job's retention rules. It considers only snapshots tagged `job:<job>`, grouped by host, and adds `--prune` if enabled.
+4. If the repository last passed a check `CHECK_EVERY` days ago or more, or never, it runs `restic check`, reading `CHECK_READ_DATA` of the data. See [`check`](#resticagent-check-job---read-data-percent). If the check fails, so does the run.
 
-Both restic commands wait up to 30 minutes for a repository lock, so jobs that share a repository take turns instead of failing.
+The restic commands wait up to 30 minutes for a repository lock, so jobs that share a repository take turns instead of failing.
 
 ## Monitoring
 
@@ -231,7 +234,7 @@ Runs of the systemd service, from the timer or from `start`, show desktop notifi
 | 🔄 | a backup starts, naming its paths | passes, without piling up in the notification list |
 | ✅ | a backup succeeds, with how long it took | passes, without piling up |
 | ⚠️ | a backup saved a snapshot, but could not read some files (exit 3) | stays in the list |
-| ❌ | a backup fails, with the last line of its log | critical: stays on screen until dismissed |
+| ❌ | a backup or its repository check fails, with the last line of its log | critical: stays on screen until dismissed |
 
 `NOTIFY_DESKTOP` chooses which ones you get: `all` (the default), `failures` for only ⚠️ and ❌, or `off`. A `run` in a terminal shows none. The service runs `run JOB --notify` for the start and success notices. For system-wide jobs, every user logged in at a seat gets them.
 
@@ -395,6 +398,19 @@ drwxr-xr-x 2 me me    0 Sep 30 11:05 letters
 - **The listing is `ls -alh` itself.** `show` mounts the job's snapshots with `restic mount` on a temporary directory, runs `ls` inside the snapshot, and unmounts again, also after Ctrl-C. This needs FUSE: the `fuse3` package, which most desktop systems have. Owners are named after this host's users and groups. Directories show a size of 0, since restic does not record one.
 - **`--tree` runs `tree`** on the paths that `restic ls` lists, using `tree --fromfile`, so it needs the `tree` command but no FUSE. The first line is the shown path, or the deepest directory holding all backed-up paths. On a large snapshot, give a PATH or pipe the tree into `less`.
 
+### `resticagent find JOB PATTERN... [restic find options]`
+
+Finds which snapshots of a job hold files that match a pattern, newest first. It is the step before `restore` when you know what you lost, but not when you had it last.
+
+```sh
+resticagent find home budget.ods                   # by name, anywhere
+resticagent find home '*.pdf' -i                   # by pattern, ignoring case
+resticagent find home '/home/me/Documents/*'       # below a path
+resticagent find home notes.txt --newest 2026-09-30  # changed before that date
+```
+
+A pattern is a name or a path, with `*` and `?`. Quote it, so the shell doesn't expand it. Options go to `restic find`, such as `-i`, `--long`, `--oldest` and `--newest`. Only the job's own snapshots are searched, so `--tag` is refused. Restore a match with `resticagent restore home SNAPSHOT PATH`.
+
 ### `resticagent diff JOB [SNAPSHOT [SNAPSHOT]] [--metadata]`
 
 Shows what changed between two snapshots of a job: files added (`+`), removed (`-`) and changed (`M`), then a summary.
@@ -527,6 +543,21 @@ To browse snapshots like a folder, use `restic mount /mnt/restic`. This needs FU
 
 ## The repository
 
+### `resticagent check [JOB...] [--read-data PERCENT]`
+
+Checks the repositories of every job, or of the given jobs, for errors with `restic check`. A repository that several jobs share is checked once.
+
+```sh
+resticagent check                      # the structure of every repository
+resticagent check home --read-data 5%  # also read 5% of home's stored data
+```
+
+- **Without `--read-data`,** the check makes sure that the index, the snapshots and their folder trees are complete and consistent. It reads little of the stored data, so it is quick.
+- **`--read-data 5%`** also reads a random 5% of the stored data and verifies it, which finds damaged files on the storage. Each check picks another random 5%. `100%` reads everything, which downloads the whole repository.
+- **Runs check on their own.** After a backup, if its repository last passed a check `CHECK_EVERY` days ago or more (7 by default), the run checks it, reading `CHECK_READ_DATA` of the data (none by default). A failed check fails the run, and its alert says that the repository check failed. Set `CHECK_EVERY` to `0` to turn this off.
+- **A passed check resets the schedule** for that repository, whichever job or command ran it. The date is kept in `~/.local/state/resticagent`, or `/var/lib/resticagent` for system-wide jobs.
+- `restic check` locks the repository for itself, so backups to it wait until it is done.
+
 ### `resticagent unlock JOB [--remove-all] [-y]`
 
 A restic command that crashes or is killed can leave its lock in the repository. A run then fails with `unable to create lock` and exit code 11. `unlock` removes stale locks: those whose process is gone, or that are too old. Locks of commands that still run stay, so it is safe at any time.
@@ -557,6 +588,8 @@ All files are plain text. Values are written as `KEY='VALUE'`, one per line, and
 | `RESTIC_COMPRESSION` | `auto`, `off` or `max` |
 | `NOTIFY_DESKTOP` | Desktop notifications: `all` (start, success and failure, the default), `failures` or `off` |
 | `NOTIFY_MAIL` | `0` turns mail about failed runs off. It is on by default, and goes to your account, or to root for system-wide jobs. |
+| `CHECK_EVERY` | Days between the repository checks after backups. `7` by default, `0` for never. |
+| `CHECK_READ_DATA` | The share of the stored data each of those checks reads, like `5%`. None by default. |
 | any other key | Passed to restic as an environment variable, for example backend credentials |
 
 ### `~/.config/resticagent/config.d/<job>/env`
