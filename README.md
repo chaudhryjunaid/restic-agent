@@ -129,12 +129,18 @@ Things to know about your own jobs:
 | `run JOB` | Run a job directly in the terminal, outside systemd |
 | `status [JOB]` | Show timer state, last run, result and next run |
 | `logs [JOB]` | Show the journal of all jobs or one job |
+| `stats [JOB...]` | Show each job's snapshots and the space they take |
 | `notify [JOB] --test` | Send a test failure alert. A failed run sends a real one through systemd. |
 | `snapshots JOB` | List a job's snapshots |
 | `show JOB [SNAPSHOT] [PATH]` | Show the files in a snapshot with `ls -alh`, or with `tree` given `--tree` |
+| `diff JOB [SNAPSHOT [SNAPSHOT]]` | Show what changed between two snapshots, by default the last two |
+| `mount JOB [DIR]` | Browse a job's snapshots as folders, until Ctrl-C |
 | `restore JOB [SNAPSHOT] [PATH]` | Restore files in place, or below `--target DIR`, after previewing the changes |
 | `forget JOB` | Forget a job's snapshots by count or age, after listing them |
+| `pause JOB...`, `resume JOB...` | Stop jobs' timers for a while, and start them again |
 | `remove JOB...` | Deactivate and delete jobs, or everything with `--all` |
+| `unlock JOB` | Remove stale locks from a job's repository |
+| `key [JOB]` | Change the repository password, and the password file with it |
 
 None of them need root for your own jobs. For system-wide jobs, every command needs `sudo` except `status` and `logs`, which also work with `--system`. `ls`, `rm` and `log` work as short forms of `list`, `remove` and `logs`. See [USAGE.md](USAGE.md) for every option, the configuration file format, restoring files and troubleshooting.
 

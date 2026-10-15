@@ -554,6 +554,9 @@ service_unit() { printf '%s%s.service' "$UNIT_PREFIX" "$1"; }
 dropin_dir()   { printf '%s/%s.d' "$SYSTEMD_DIR" "$(timer_unit "$1")"; }
 wants_link()   { printf '%s/timers.target.wants/%s' "$SYSTEMD_DIR" "$(timer_unit "$1")"; }
 
+# job_paused JOB -> true when "pause" stopped the job's timer until "resume"
+job_paused() { [[ -f "$JOBS_DIR/$1/paused" ]]; }
+
 # job_installed JOB -> true when the job has a timer drop-in or an enabled timer
 job_installed() {
   [[ -d "$(dropin_dir "$1")" || -L "$(wants_link "$1")" ]]
@@ -1275,7 +1278,7 @@ install_templates() {
 }
 
 cmd_install() {
-  local skip_repo_check=0 all_jobs=0 arg job unit was_active
+  local skip_repo_check=0 all_jobs=0 arg job unit was_active paused=0
   local -a jobs=() ready=() failed=()
   local -A changed=() schedule=()
   for arg in "$@"; do
@@ -1327,6 +1330,13 @@ cmd_install() {
   fi
   for job in "${ready[@]}"; do
     unit=$(timer_unit "$job")
+    if job_paused "$job"; then
+      # A paused job stays off until resume, whatever install does.
+      run_systemctl disable --now --quiet "$unit" 2>/dev/null || true
+      info "  paused     $unit. Resume it with: $SUDO$PROG resume $job"
+      paused=$(( paused + 1 ))
+      continue
+    fi
     was_active=0
     unit_is_active "$unit" && was_active=1
     # enable is idempotent: it creates the boot symlink only if missing.
@@ -1346,7 +1356,11 @@ cmd_install() {
   if (( ${#ready[@]} > 0 )); then
     printf '  %-16s %-24s %s\n' JOB SCHEDULE "NEXT RUN"
     for job in "${ready[@]}"; do
-      printf '  %-16s %-24s %s\n' "$job" "${schedule[$job]}" "$(next_run "$(timer_unit "$job")" "${schedule[$job]}")"
+      if job_paused "$job"; then
+        printf '  %-16s %-24s %s\n' "$job" "${schedule[$job]}" paused
+      else
+        printf '  %-16s %-24s %s\n' "$job" "${schedule[$job]}" "$(next_run "$(timer_unit "$job")" "${schedule[$job]}")"
+      fi
     done
     # A user's manager, and with it their timers, runs only while they are
     # logged in, unless lingering is enabled for them.
@@ -1360,7 +1374,7 @@ cmd_install() {
     warn "not activated: ${failed[*]} (see the messages above)"
     return 1
   fi
-  ok "${#ready[@]} job(s) active"
+  ok "$(( ${#ready[@]} - paused )) job(s) active$( (( paused == 0 )) || printf ', %d paused' "$paused")"
 }
 
 # ---------------------------------------------------------------------------
@@ -1421,6 +1435,8 @@ cmd_start() {
     || die "the systemd units are not installed yet. Run: $SUDO$PROG install $job"
   if ! job_installed "$job"; then
     note "job '$job' has no timer yet, so it only runs when started by hand. Schedule it with: $SUDO$PROG install $job"
+  elif job_paused "$job"; then
+    note "job '$job' is paused, so only this run happens. Resume its schedule with: $SUDO$PROG resume $job"
   fi
   unit=$(service_unit "$job")
 
@@ -1901,13 +1917,13 @@ check_snapshot_arg() {
 }
 
 # resolve_snapshot JOB SNAPSHOT [PATH] -> finds SNAPSHOT (an ID or latest) of
-# JOB and prints its header. Sets SNAP_ID, and SNAP_ROOTS to PATH or else to
-# the paths the snapshot backed up. restic ignores --tag for an explicit ID,
+# JOB. Sets SNAP_ID, SNAP_TIME, SNAP_HOST, SNAP_LABEL (a title for it), and
+# SNAP_ROOTS to PATH or else to the paths the snapshot backed up. restic ignores --tag for an explicit ID,
 # so the job tag is checked here, and another job's snapshot is refused.
 # Returns restic's exit code, or 1, after saying what went wrong.
-SNAP_ID='' SNAP_ROOTS=()
+SNAP_ID='' SNAP_ROOTS=() SNAP_TIME='' SNAP_HOST='' SNAP_LABEL=''
 resolve_snapshot() {
-  local job=$1 snap=$2 path=${3:-} json errfile time host tag found=0 rc=0
+  local job=$1 snap=$2 path=${3:-} json errfile tag found=0 rc=0
   local -a tags=()
   errfile=$(mktemp)
   if [[ "$snap" == latest ]]; then
@@ -1943,9 +1959,17 @@ resolve_snapshot() {
   else
     mapfile -t SNAP_ROOTS < <(json_strings paths <<<"$json")
   fi
-  time=$(json_strings time <<<"$json")
-  host=$(json_strings hostname <<<"$json")
-  header "Snapshot ${SNAP_ID:0:8} of job '$job', made ${time:0:10} ${time:11:5} on $host"
+  SNAP_TIME=$(json_strings time <<<"$json")
+  SNAP_TIME="${SNAP_TIME:0:10} ${SNAP_TIME:11:5}"
+  SNAP_HOST=$(json_strings hostname <<<"$json")
+  SNAP_LABEL="Snapshot ${SNAP_ID:0:8} of job '$job', made $SNAP_TIME on $SNAP_HOST"
+}
+
+# fuse_available -> true when restic can mount here: /dev/fuse, and for users
+# the setuid fusermount helper
+fuse_available() {
+  [[ -e /dev/fuse ]] || return 1
+  (( EUID == 0 )) || command -v fusermount3 >/dev/null 2>&1 || command -v fusermount >/dev/null 2>&1
 }
 
 # The temporary FUSE mount that show runs ls in, and the restic process behind it
@@ -2012,13 +2036,14 @@ cmd_show() {
   if [[ "$mode" == tree ]]; then
     command -v tree >/dev/null 2>&1 \
       || die "--tree needs the tree command. Install it with your package manager (apt, dnf, pacman, zypper)"
-  elif [[ ! -e /dev/fuse ]] || { (( EUID != 0 )) && ! command -v fusermount3 >/dev/null 2>&1 && ! command -v fusermount >/dev/null 2>&1; }; then
+  elif ! fuse_available; then
     die "show runs ls on a FUSE mount of the snapshot, and FUSE is not available here. Install fuse3 with your package manager, or use --tree, which does not need it"
   fi
   require_restic
   load_job_env "$job"
   export_job_env
   resolve_snapshot "$job" "$snap" "$path" || return
+  header "$SNAP_LABEL"
   id=$SNAP_ID
   roots=("${SNAP_ROOTS[@]}")
 
@@ -2203,6 +2228,7 @@ cmd_restore() {
   load_job_env "$job"
   export_job_env
   resolve_snapshot "$job" "$snap" "$path" || return
+  header "$SNAP_LABEL"
   id=$SNAP_ID
 
   # A folder is restored with itself as the target, so --delete cannot reach
@@ -2507,6 +2533,7 @@ install_state() {
   if [[ ! -f "$dropin" ]]; then echo "not installed"; return 0; fi
   load_job_env "$job"
   if ! cmp -s "$dropin" <(render_dropin "$job"); then echo "needs install"; return 0; fi
+  if job_paused "$job"; then echo paused; return 0; fi
   if timer_enabled "$job"; then echo installed; else echo disabled; fi
 }
 
@@ -2559,7 +2586,7 @@ cmd_list() {
     state=$(install_state "$job")
     case $state in
       orphaned) hint_orphan=1 ;;
-      installed) ;;
+      installed|paused) ;;
       *) hint_install=1 ;;
     esac
     if [[ "$state" == orphaned ]]; then
@@ -2638,7 +2665,9 @@ status_of() {
   unit_props tp "$(timer_unit "$job")" ActiveState,NextElapseUSecRealtime
   unit_props sp "$(service_unit "$job")" ActiveState,Result,ExecMainStatus,ExecMainStartTimestamp
 
-  if job_installed "$job"; then
+  if job_paused "$job"; then
+    S_TIMER=paused
+  elif job_installed "$job"; then
     S_TIMER=${tp[ActiveState]:-unknown}
     timer_enabled "$job" || S_TIMER+=", disabled"
   else
@@ -2858,6 +2887,381 @@ cmd_remove() {
 }
 
 # ---------------------------------------------------------------------------
+# pause and resume: stop a job's timer for a while, keeping the job
+# ---------------------------------------------------------------------------
+
+# pause_args NAME ARG... -> sets jobs to the job names among ARG, for command NAME
+pause_args() {
+  local name=$1 arg
+  shift
+  jobs=()
+  for arg in "$@"; do
+    case $arg in
+      -*) die "unknown option '$arg' (see '$PROG help')" ;;
+      *)  validate_job_name "$arg" || die "invalid job name '$arg'"; jobs+=("$arg") ;;
+    esac
+  done
+  (( ${#jobs[@]} > 0 )) || die "usage: $PROG $name JOB...  (see '$PROG help')"
+  for arg in "${jobs[@]}"; do
+    [[ -d "$JOBS_DIR/$arg" ]] || die "no job '$arg' is configured. See the jobs with: $SUDO$PROG list"
+  done
+}
+
+cmd_pause() {
+  local job unit
+  local -a jobs=()
+  pause_args pause "$@"
+  require_root pause "$@"
+  require_systemd
+  for job in "${jobs[@]}"; do
+    unit=$(timer_unit "$job")
+    if job_paused "$job"; then
+      info "  paused     $job, already"
+      continue
+    fi
+    # The mark keeps the timer off across install, until resume.
+    date '+%Y-%m-%d %H:%M %Z' >"$JOBS_DIR/$job/paused"
+    if job_installed "$job"; then
+      run_systemctl disable --now --quiet "$unit"
+      ok "paused     $job: stopped and disabled $unit"
+    else
+      ok "paused     $job, which has no timer yet"
+    fi
+    if service_running "$job"; then note "  a backup of '$job' is running now, and it finishes"; fi
+  done
+  note "Resume with: $SUDO$PROG resume ${jobs[*]}"
+}
+
+cmd_resume() {
+  local job unit
+  local -a jobs=()
+  pause_args resume "$@"
+  require_root resume "$@"
+  require_systemd
+  for job in "${jobs[@]}"; do
+    unit=$(timer_unit "$job")
+    if ! job_paused "$job"; then
+      info "  not paused $job"
+      continue
+    fi
+    rm -f -- "$JOBS_DIR/$job/paused"
+    if [[ -d "$(dropin_dir "$job")" ]]; then
+      run_systemctl enable --now --quiet "$unit"
+      ok "resumed    $job: enabled and started $unit"
+    else
+      ok "resumed    $job. Activate its timer with: $SUDO$PROG install $job"
+    fi
+  done
+  note "Timers catch up: a job that missed a run while paused runs now."
+}
+
+# ---------------------------------------------------------------------------
+# diff: what changed between two snapshots of a job
+# ---------------------------------------------------------------------------
+cmd_diff() {
+  local job='' arg old='' new='' old_label new_label host json i
+  local -a snaps=() opts=() ids=()
+  for arg in "$@"; do
+    case $arg in
+      -*) opts+=("$arg") ;;
+      *)
+        if [[ -z "$job" ]]; then job=$arg
+        elif (( ${#snaps[@]} < 2 )); then snaps+=("$arg")
+        else die "usage: $PROG diff JOB [SNAPSHOT [SNAPSHOT]] [restic diff options]  (see '$PROG help')"
+        fi ;;
+    esac
+  done
+  [[ -n "$job" ]] || die "usage: $PROG diff JOB [SNAPSHOT [SNAPSHOT]] [restic diff options]  (see '$PROG help')"
+  validate_job_name "$job" || die "invalid job name '$job'"
+  for arg in "${snaps[@]}"; do check_snapshot_arg "$job" "$arg"; done
+  require_root diff "$@"
+  [[ -f "$JOBS_DIR/$job/env" ]] || die "job '$job' is not configured. Run: $SUDO$PROG add $job"
+  require_restic
+  load_job_env "$job"
+  export_job_env
+
+  # The newer snapshot: the second one given, or else the latest.
+  resolve_snapshot "$job" "${snaps[1]:-latest}" || return
+  new=$SNAP_ID new_label="${SNAP_ID:0:8} ($SNAP_TIME on $SNAP_HOST)" host=$SNAP_HOST
+  if (( ${#snaps[@]} > 0 )); then
+    resolve_snapshot "$job" "${snaps[0]}" || return
+    old=$SNAP_ID
+  else
+    # The snapshot before it from the same host, as retention groups them.
+    json=$(restic snapshots --no-lock --json --tag "job:$job" --host "$host") \
+      || die "could not read the snapshots of job '$job'"
+    mapfile -t ids < <(json_ids <<<"$json")
+    for i in "${!ids[@]}"; do
+      if [[ "${ids[$i]}" == "$new" ]] && (( i > 0 )); then old=${ids[$(( i - 1 ))]}; fi
+    done
+    if [[ -z "$old" ]]; then
+      info "Job '$job' has only one snapshot from $host, so there is nothing to compare yet."
+      return 0
+    fi
+    resolve_snapshot "$job" "$old" || return
+  fi
+  old_label="${SNAP_ID:0:8} ($SNAP_TIME on $SNAP_HOST)"
+  if [[ "$old" == "$new" ]]; then
+    info "Both are snapshot ${new:0:8}, so there is nothing to compare."
+    return 0
+  fi
+  header "Job '$job': changes from snapshot $old_label to $new_label"
+  restic diff --no-lock "$old" "$new" "${opts[@]}"
+}
+
+# ---------------------------------------------------------------------------
+# mount: browse a job's snapshots as folders, until Ctrl-C
+# ---------------------------------------------------------------------------
+cmd_mount() {
+  local job='' dir='' arg created=0 rc=0
+  for arg in "$@"; do
+    case $arg in
+      -*) die "unknown option '$arg' (see '$PROG help')" ;;
+      *)
+        if [[ -z "$job" ]]; then job=$arg
+        elif [[ -z "$dir" ]]; then dir=$arg
+        else die "usage: $PROG mount JOB [DIR]  (see '$PROG help')"
+        fi ;;
+    esac
+  done
+  [[ -n "$job" ]] || die "usage: $PROG mount JOB [DIR]  (see '$PROG help')"
+  validate_job_name "$job" || die "invalid job name '$job'"
+  require_root mount "$@"
+  [[ -f "$JOBS_DIR/$job/env" ]] || die "job '$job' is not configured. Run: $SUDO$PROG add $job"
+  fuse_available || die "mount needs FUSE, which is not available here. Install fuse3 with your package manager"
+  require_restic
+  load_job_env "$job"
+  export_job_env
+  if [[ -z "$dir" ]]; then
+    if [[ "$SCOPE" == system ]]; then dir="/run/resticagent-$job"
+    else dir="${XDG_RUNTIME_DIR:-${TMPDIR:-/tmp}/resticagent-$(id -u)}/resticagent-$job"
+    fi
+  fi
+  [[ "$dir" == /* ]] || dir="$PWD/$dir"
+  if [[ -e "$dir" ]]; then
+    [[ -d "$dir" ]] || die "$dir is not a directory"
+    if mountpoint -q "$dir"; then die "something is mounted at $dir already"; fi
+    [[ -z "$(ls -A "$dir")" ]] || die "$dir is not empty. Mount into an empty or a new directory"
+  else
+    mkdir -p -- "$dir"
+    created=1
+  fi
+
+  header "Snapshots of job '$job' at $dir"
+  info "  snapshots/latest  the newest snapshot, with the original paths below it"
+  info "  snapshots/        every snapshot by time, and by ID in ids/"
+  note "While mounted, the repository is locked: backups go on, but their retention"
+  note "waits for the unmount. Press Ctrl-C to unmount."
+  # Ctrl-C reaches restic, which unmounts. The trap only keeps this script
+  # going afterwards, to clean up.
+  trap 'true' INT
+  restic mount --tag "job:$job" "$dir" || rc=$?
+  trap - INT
+  if mountpoint -q "$dir"; then
+    fusermount3 -u "$dir" 2>/dev/null || fusermount -u "$dir" 2>/dev/null || umount "$dir" 2>/dev/null || true
+  fi
+  if (( created )); then rmdir -- "$dir" 2>/dev/null || true; fi
+  return "$rc"
+}
+
+# ---------------------------------------------------------------------------
+# stats: how many snapshots jobs have, and how much space they take
+# ---------------------------------------------------------------------------
+
+# json_number KEY -> the number value of the first KEY in the JSON on stdin
+json_number() { { grep -oE "\"$1\":[0-9.]+" || true; } | head -n 1 | cut -d: -f2; }
+
+# human_size BYTES -> a size such as 512 B, 1.5 KiB or 12.3 GiB
+human_size() {
+  awk -v b="${1:-0}" 'BEGIN {
+    split("B KiB MiB GiB TiB PiB", u, " ")
+    for (i = 1; b >= 1024 && i < 6; i++) b /= 1024
+    printf(i == 1 ? "%d %s" : "%.1f %s", b, u[i])
+  }'
+}
+
+# stats_job JOB -> the snapshots of JOB and the space they take. Run it in a
+# subshell, since it exports the job's settings for restic.
+stats_job() {
+  local job=$1 json n time size files stored raw
+  load_job_env "$job"
+  export_job_env
+  header "Job '$job'  (${JENV[RESTIC_REPOSITORY]:-?})"
+  json=$(restic snapshots --no-lock --json --tag "job:$job") || return
+  n=$(json_ids <<<"$json" | grep -c . || true)
+  if (( n == 0 )); then
+    info "  no snapshots yet"
+    return 0
+  fi
+  # Snapshots come oldest first, so the last time is the latest one's.
+  time=$({ grep -oE '"time":"[^"]+"' <<<"$json" || true; } | tail -n 1 | cut -d'"' -f4)
+  json=$(restic stats --no-lock --json --tag "job:$job" latest) || return
+  size=$(json_number total_size <<<"$json")
+  files=$(json_number total_file_count <<<"$json")
+  json=$(restic stats --no-lock --json --mode raw-data --tag "job:$job") || return
+  stored=$(json_number total_size <<<"$json")
+  raw=$(json_number total_uncompressed_size <<<"$json")
+  row "Snapshots"       "$n, the latest from ${time:0:10} ${time:11:5}"
+  row "Latest snapshot" "$(human_size "$size") in $(printf "%'d" "${files:-0}") files and folders"
+  row "Stored"          "$(human_size "$stored") for all $n snapshots, $(human_size "$raw") before compression"
+}
+
+# stats_repo JOB -> totals of the repository that JOB backs up to
+stats_repo() {
+  local json
+  load_job_env "$1"
+  export_job_env
+  header "Repository ${JENV[RESTIC_REPOSITORY]:-?}"
+  json=$(restic stats --no-lock --json --mode raw-data) || return
+  row "Snapshots" "$(json_number snapshots_count <<<"$json"), of all jobs and hosts"
+  row "Stored"    "$(human_size "$(json_number total_size <<<"$json")"), $(human_size "$(json_number total_uncompressed_size <<<"$json")") before compression"
+}
+
+cmd_stats() {
+  local arg job repo rc=0
+  local -a jobs=()
+  local -A repos=()
+  for arg in "$@"; do
+    case $arg in
+      -*) die "unknown option '$arg' (see '$PROG help')" ;;
+      *)  validate_job_name "$arg" || die "invalid job name '$arg'"; jobs+=("$arg") ;;
+    esac
+  done
+  require_root stats "$@"
+  if (( ${#jobs[@]} == 0 )); then mapfile -t jobs < <(list_jobs); fi
+  if (( ${#jobs[@]} == 0 )); then
+    info "No jobs are configured. Add one with: $SUDO$PROG add <job>"
+    return 0
+  fi
+  for job in "${jobs[@]}"; do
+    [[ -f "$JOBS_DIR/$job/env" ]] || die "job '$job' is not configured. Run: $SUDO$PROG add $job"
+  done
+  require_restic
+  # Each job in a subshell, so one job's credentials never reach another's restic.
+  for job in "${jobs[@]}"; do
+    ( stats_job "$job" ) || rc=$?
+    load_job_env "$job"
+    repo=${JENV[RESTIC_REPOSITORY]:-}
+    if [[ -n "$repo" && -z "${repos[$repo]:-}" ]]; then repos[$repo]=$job; fi
+  done
+  for repo in "${!repos[@]}"; do
+    ( stats_repo "${repos[$repo]}" ) || rc=$?
+  done
+  return "$rc"
+}
+
+# ---------------------------------------------------------------------------
+# unlock and key: looking after a job's repository
+# ---------------------------------------------------------------------------
+cmd_unlock() {
+  local job='' all=0 yes=0 arg
+  for arg in "$@"; do
+    case $arg in
+      --remove-all) all=1 ;;
+      -y|--yes)     yes=1 ;;
+      -*)           die "unknown option '$arg' (see '$PROG help')" ;;
+      *)            [[ -z "$job" ]] || die "unlock takes a single job"; job=$arg ;;
+    esac
+  done
+  [[ -n "$job" ]] || die "usage: $PROG unlock JOB [--remove-all] [-y]  (see '$PROG help')"
+  validate_job_name "$job" || die "invalid job name '$job'"
+  require_root unlock "$@"
+  [[ -f "$JOBS_DIR/$job/env" ]] || die "job '$job' is not configured. Run: $SUDO$PROG add $job"
+  require_restic
+  load_job_env "$job"
+  export_job_env
+  if (( ! all )); then
+    # restic only removes stale locks: of processes that are gone, or old.
+    restic unlock
+    return
+  fi
+  if service_running "$job"; then
+    die "a backup of '$job' is running now, and its lock is in use. Wait for it to finish"
+  fi
+  header "This will"
+  info "  - remove every lock in ${JENV[RESTIC_REPOSITORY]:-?}, also those of restic commands that still run"
+  note "Do this only when no backup, restore or other restic command uses the repository, on any machine."
+  if (( ! yes )); then
+    ask_yesno "Proceed?" n || die "no lock removed"
+  fi
+  restic unlock --remove-all
+}
+
+cmd_key() {
+  local job='' list=0 arg repo pwfile dir tmp p1 p2 other
+  local -a others=()
+  local -A je=()
+  for arg in "$@"; do
+    case $arg in
+      --list) list=1 ;;
+      -*)     die "unknown option '$arg' (see '$PROG help')" ;;
+      *)      [[ -z "$job" ]] || die "key takes a single job"; job=$arg ;;
+    esac
+  done
+  if [[ -n "$job" ]]; then validate_job_name "$job" || die "invalid job name '$job'"; fi
+  require_root key "$@"
+  JENV=()
+  if [[ -n "$job" ]]; then
+    [[ -f "$JOBS_DIR/$job/env" ]] || die "job '$job' is not configured. Run: $SUDO$PROG add $job"
+    load_job_env "$job"
+  else
+    [[ -f "$GLOBAL_CONFIG" ]] || die "no global settings at $GLOBAL_CONFIG. Run: $SUDO$PROG init"
+    read_env JENV "$GLOBAL_CONFIG"
+  fi
+  export_job_env
+  repo=${JENV[RESTIC_REPOSITORY]:-}
+  pwfile=${JENV[RESTIC_PASSWORD_FILE]:-}
+  [[ -n "$repo" ]] || die "no repository is set. Set it with: $SUDO$PROG init"
+  require_restic
+  if (( list )); then
+    header "Keys of $repo"
+    restic key list --no-lock
+    return
+  fi
+  [[ -n "$pwfile" && -f "$pwfile" ]] \
+    || die "key puts the new password in the password file, and ${pwfile:-RESTIC_PASSWORD_FILE} is missing. Set it with: $SUDO$PROG init"
+  [[ -t 0 ]] || die "key asks for the new password, so run it in a terminal"
+
+  # Jobs that open the same repository through another password file would
+  # keep the current password, and stop working.
+  while IFS= read -r other; do
+    je=()
+    read_env je "$GLOBAL_CONFIG"
+    read_env je "$JOBS_DIR/$other/env"
+    if [[ "${je[RESTIC_REPOSITORY]:-}" == "$repo" && "${je[RESTIC_PASSWORD_FILE]:-}" != "$pwfile" ]]; then
+      others+=("$other (${je[RESTIC_PASSWORD_FILE]:-no password file})")
+    fi
+  done < <(list_jobs)
+
+  header "This will"
+  info "  - change the password of $repo: restic adds a key for the new password and removes the current one"
+  info "  - write the new password to $pwfile"
+  for other in "${others[@]}"; do warn "job $other opens this repository with another password file. Put the new password there too"; done
+  note "Other machines and users that open this repository with the current password need the new one."
+  ask_yesno "Proceed?" n || die "the password was not changed"
+  while true; do
+    read -r -s -p "New repository password: " p1 || die "aborted"; printf '\n'
+    read -r -s -p "Repeat the new password: " p2 || die "aborted"; printf '\n'
+    [[ -n "$p1" && "$p1" == "$p2" ]] && break
+    warn "the passwords are empty or do not match"
+  done
+
+  # The new password goes next to the old file first, so replacing that is a
+  # rename, which cannot leave it half written.
+  dir=$(dirname "$pwfile")
+  tmp=$(mktemp "$dir/.password.XXXXXX") || die "cannot write in $dir"
+  printf '%s\n' "$p1" >"$tmp"
+  if ! restic key passwd --new-password-file "$tmp"; then
+    rm -f -- "$tmp"
+    die "restic did not change the password, so nothing changed"
+  fi
+  mv -f -- "$tmp" "$pwfile" \
+    || die "the password changed, but $pwfile could not be replaced: the new password is in $tmp. Move it there now"
+  ok "changed the password of $repo. $pwfile holds the new one"
+  note "Keep a copy of the new password somewhere safe."
+}
+
+# ---------------------------------------------------------------------------
 # Dispatcher
 # ---------------------------------------------------------------------------
 usage() {
@@ -2883,6 +3287,10 @@ Activation:
                       Install this program and the systemd units, check each
                       job's repository, and enable one timer per job. Without
                       JOB names every configured job is installed.
+  pause JOB...        Stop the timers of the jobs until resume, also across
+                      install. The jobs and their settings stay.
+  resume JOB...       Start the timers of paused jobs again. A run that was
+                      missed while paused starts right away.
   remove JOB... [--keep-config] [-y]
                       Stop and delete the jobs' timers and their config.
                       With --keep-config the config stays, for a later install.
@@ -2895,6 +3303,8 @@ Monitoring:
   status [JOB]        Timer state, last run, result and next run of every job.
                       With JOB, the full systemctl status of its units.
                       Exits 1 when a job's last run failed.
+  stats [JOB...]      Snapshots, size and stored space of every job, or of
+                      the given jobs, and totals of their repositories.
   logs [JOB] [--last] [journalctl options]
                       The journal of every job, or of one job, opened at the
                       newest line. --last shows only the most recent run of JOB.
@@ -2926,6 +3336,13 @@ Snapshots:
                       from snapshots, latest by default. PATH is an absolute
                       path in the snapshot. Without it, the backed-up paths
                       are shown. ls runs on a temporary FUSE mount.
+  diff JOB [SNAPSHOT [SNAPSHOT]] [--metadata]
+                      What changed between two snapshots of JOB: by default
+                      the latest and the one before it from the same host.
+                      One SNAPSHOT is compared with the latest.
+  mount JOB [DIR]     Show the snapshots of JOB as folders at DIR until
+                      Ctrl-C. By default DIR is a new folder in your runtime
+                      directory, or in /run for system-wide jobs.
   restore JOB [SNAPSHOT] [PATH] [--target DIR] [--overwrite MODE] [--delete]
           [--dry-run] [-y]
                       Put files from a snapshot of JOB back, in place or below
@@ -2943,6 +3360,14 @@ Snapshots:
                       either keeps it. --oldest N forgets the N oldest. Their
                       data is pruned if the job's PRUNE setting is on.
                       --dry-run only lists them.
+
+Repository:
+  unlock JOB [--remove-all] [-y]
+                      Remove stale locks, left by restic commands that ended
+                      without cleaning up. --remove-all removes every lock.
+  key [JOB] [--list]  Change the password of JOB's repository, or of the
+                      default one, and write it to the password file. --list
+                      shows the repository's keys instead.
 
 Other:
   help                Show this help
@@ -2979,6 +3404,13 @@ main() {
     snapshots)         cmd_snapshots "$@" ;;
     show)              cmd_show "$@" ;;
     restore)           cmd_restore "$@" ;;
+    diff)              cmd_diff "$@" ;;
+    mount)             cmd_mount "$@" ;;
+    stats)             cmd_stats "$@" ;;
+    pause)             cmd_pause "$@" ;;
+    resume)            cmd_resume "$@" ;;
+    unlock)            cmd_unlock "$@" ;;
+    key)               cmd_key "$@" ;;
     forget)            cmd_forget "$@" ;;
     help|-h|--help)    usage ;;
     version|--version) echo "$PROG $VERSION" ;;

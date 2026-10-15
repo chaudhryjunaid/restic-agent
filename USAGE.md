@@ -5,11 +5,12 @@ This guide covers every command, the configuration files, restoring data and tro
 - [Concepts](#concepts)
 - [Setting up](#setting-up): `init`, `add`, `import`, `install`
 - [Running backups](#running-backups): schedules, `start`, `run`
-- [Monitoring](#monitoring): notifications with `notify`, `status`, `logs`, `list`
-- [Changing a job](#changing-a-job)
-- [Snapshots](#snapshots): `snapshots`, `show`, `forget`
+- [Monitoring](#monitoring): notifications with `notify`, `status`, `logs`, `list`, `stats`
+- [Changing a job](#changing-a-job): pausing with `pause` and `resume`
+- [Snapshots](#snapshots): `snapshots`, `show`, `diff`, `mount`, `forget`
 - [Removing jobs](#removing-jobs): `remove`
 - [Restoring files](#restoring-files): `restore`
+- [The repository](#the-repository): `unlock`, `key`
 - [File reference](#file-reference)
 - [Exit codes](#exit-codes)
 - [Troubleshooting](#troubleshooting)
@@ -305,6 +306,25 @@ Retention uses short forms: `7d 4w 6m 1y` means 7 daily, 4 weekly, 6 monthly and
 
 `list home` shows one job in full. That includes each setting and whether it comes from the job or the global settings, whether the password file exists, the next run, and every source and exclude line.
 
+### `resticagent stats [JOB...]`
+
+Shows the snapshots of every job, or of the given jobs, and the space they take. Then it shows the totals of each repository they use.
+
+```text
+Job 'home'  (sftp:backup@nas:/srv/restic)
+  Snapshots            30, the latest from 2026-10-15 02:00
+  Latest snapshot      12.3 GiB in 45,120 files and folders
+  Stored               14.1 GiB for all 30 snapshots, 20.6 GiB before compression
+
+Repository sftp:backup@nas:/srv/restic
+  Snapshots            42, of all jobs and hosts
+  Stored               16.0 GiB, 23.9 GiB before compression
+```
+
+- **Latest snapshot** is the size of the files if you restored it.
+- **Stored** is what the job's snapshots take in the repository, after deduplication and compression. Data the job shares with other jobs counts for each of them, so the jobs' numbers can add up to more than the repository's.
+- `stats` reads every snapshot, which takes a while on big repositories, and more so over the network.
+
 ## Changing a job
 
 - **Re-run `add`** for the job. Every prompt starts from the current value.
@@ -312,6 +332,12 @@ Retention uses short forms: `7d 4w 6m 1y` means 7 daily, 4 weekly, 6 monthly and
 - **Or edit the files directly.** Keep the `KEY='VALUE'` format described in the [File reference](#file-reference).
 - **After changing the schedule, run `install`.** `list` shows `needs install` until you do. Other changes take effect at the next run.
 - **To change global settings,** run `init` again.
+
+### Pausing a job: `resticagent pause JOB...` and `resume JOB...`
+
+`pause` stops a job's timer and disables it, for example while the backup disk is away. The job and its settings stay, and `start` can still run it by hand. A paused job stays paused when you run `install`, until you `resume` it. `list` and `status` show it as `paused`.
+
+`resume` enables and starts the timer again. Timers are persistent, so a job that missed a run while paused runs right away.
 
 ### Moving a system-wide job to your own
 
@@ -368,6 +394,33 @@ drwxr-xr-x 2 me me    0 Sep 30 11:05 letters
 - **PATH is an absolute path** as it was on the backed-up machine. It can be a directory or a file. Without it, every path the snapshot backed up is shown, one section each.
 - **The listing is `ls -alh` itself.** `show` mounts the job's snapshots with `restic mount` on a temporary directory, runs `ls` inside the snapshot, and unmounts again, also after Ctrl-C. This needs FUSE: the `fuse3` package, which most desktop systems have. Owners are named after this host's users and groups. Directories show a size of 0, since restic does not record one.
 - **`--tree` runs `tree`** on the paths that `restic ls` lists, using `tree --fromfile`, so it needs the `tree` command but no FUSE. The first line is the shown path, or the deepest directory holding all backed-up paths. On a large snapshot, give a PATH or pipe the tree into `less`.
+
+### `resticagent diff JOB [SNAPSHOT [SNAPSHOT]] [--metadata]`
+
+Shows what changed between two snapshots of a job: files added (`+`), removed (`-`) and changed (`M`), then a summary.
+
+```sh
+resticagent diff home                       # the latest snapshot and the one before it
+resticagent diff home 3f988623              # snapshot 3f988623 and the latest
+resticagent diff home 3f988623 7dfe59c4     # 3f988623 and 7dfe59c4
+resticagent diff home --metadata            # also changes of owners, modes and times
+```
+
+Without SNAPSHOT, the latest snapshot is compared with the one before it from the same host, as retention groups them. Both snapshots must belong to the job. Options go to `restic diff`.
+
+### `resticagent mount JOB [DIR]`
+
+Shows the snapshots of a job as folders at DIR, until you press Ctrl-C. Only the job's own snapshots appear.
+
+```sh
+resticagent mount home              # at $XDG_RUNTIME_DIR/resticagent-home
+resticagent mount home ~/backup     # at ~/backup, which must be empty
+```
+
+- `snapshots/latest` is the newest snapshot, with the original paths below it. `snapshots/` holds every snapshot by time, and `ids/` by ID. Open them in a file manager, or copy files out of them.
+- Without DIR, it mounts at a new folder in your runtime directory, or in `/run` for system-wide jobs, and removes that folder after unmounting.
+- It needs FUSE, like `show`.
+- **While mounted, the repository is locked.** Backups still run, but their retention waits for the lock, up to 30 minutes, and then fails. Don't leave a mount open while a job is due.
 
 ### `resticagent forget JOB ...`
 
@@ -472,6 +525,22 @@ restic restore latest --tag job:home --target /tmp/restore --include /home/me/Do
 
 To browse snapshots like a folder, use `restic mount /mnt/restic`. This needs FUSE.
 
+## The repository
+
+### `resticagent unlock JOB [--remove-all] [-y]`
+
+A restic command that crashes or is killed can leave its lock in the repository. A run then fails with `unable to create lock` and exit code 11. `unlock` removes stale locks: those whose process is gone, or that are too old. Locks of commands that still run stay, so it is safe at any time.
+
+`--remove-all` removes every lock, also those still in use. It asks first, and it refuses while a backup of the job is running. Use it only when no restic command uses the repository, on any machine.
+
+### `resticagent key [JOB] [--list]`
+
+Changes the password of the job's repository, or of the default repository without JOB. It asks for the new password twice. Then restic adds a key for it and removes the current key, and the password file gets the new password. The new password goes next to the old file first, and replaces it by a rename, so the file is never half written.
+
+- It warns about other jobs that open the same repository through a different password file, since those keep the old password.
+- Other machines and users that open the repository with the current password need the new one too.
+- `--list` shows the repository's keys instead.
+
 ## File reference
 
 All files are plain text. Values are written as `KEY='VALUE'`, one per line, and lines starting with `#` are comments. This format is valid for Bash and for systemd's `EnvironmentFile=`. A value may not contain a single quote or a backslash.
@@ -539,7 +608,7 @@ One restic exclude pattern per line, passed to `restic backup --exclude-file`. L
 
 If the backup fails, retention is skipped. If the backup succeeds but `restic forget` fails, `run` returns the code from `forget`.
 
-`forget` and `restore` return restic's exit code when restic fails, for example 11 when the lock could not be taken.
+`forget`, `restore`, `diff`, `stats` and `unlock` return restic's exit code when restic fails, for example 11 when the lock could not be taken.
 
 `status` returns 1 when any job's last run failed or was partial, and 0 otherwise. `logs` returns the exit code of `journalctl`. The other commands return 0 on success and 1 on an error.
 
@@ -563,6 +632,6 @@ If the backup fails, retention is skipped. If the backup succeeds but `restic fo
 
 **The schedule didn't change.** `resticagent list` shows `needs install` for the job. Run `resticagent install <job>`.
 
-**`unable to create lock`, or exit code 11.** Another backup or prune is holding the repository lock, or a crashed run left a stale lock. Once no backup is running, load the job's settings and run `restic unlock`, which only removes stale locks.
+**`unable to create lock`, or exit code 11.** Another backup or prune is holding the repository lock, a `mount` is open, or a crashed run left a stale lock. Run `resticagent unlock <job>`, which only removes stale locks.
 
 **A path in `src` doesn't exist.** restic logs `does not exist, skipping` and backs up the other paths, and the run still succeeds. Only when every path is missing does the backup fail. Check `resticagent logs <job> --last` for these warnings, and update the paths with `resticagent add <job>`.
