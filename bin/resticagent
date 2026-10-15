@@ -18,10 +18,11 @@
 #   config.d/<job>/src      paths to back up, one per line
 #   config.d/<job>/exclude  patterns to skip, one per line
 #
-# "install" copies this script to the program path, and puts these in the
-# unit directory:
+# "install" copies this script to the program path, with the unit templates
+# from ../systemd next to it in ../share/resticagent/systemd (setup.sh installs
+# the same layout), and puts these in the unit directory:
 #   restic-backup@.service                    unit templates,
-#   restic-backup@.timer                      from ../systemd
+#   restic-backup@.timer                      with this scope's paths
 #   restic-backup@<job>.timer.d/schedule.conf per-job schedule
 #
 # Set RESTICAGENT_ROOT to a directory to prefix every path above (development
@@ -49,6 +50,9 @@ MSG_UNIT_STARTED=39f53479d3a045ac8e11786248231fbf
 MSG_UNIT_FAILED=be02cf6855d2428ba40df7e9d022f03d
 PROG=$(basename "$0")
 SELF=$(readlink -f "${BASH_SOURCE[0]}")
+# Tools installed next to the program, such as the restic that setup.sh puts
+# in ~/.local/bin, come first. systemd's PATH does not include ~/.local/bin.
+PATH="${SELF%/*}:$PATH"
 
 # ---------------------------------------------------------------------------
 # Output helpers
@@ -98,6 +102,8 @@ set_scope() {
   fi
   GLOBAL_CONFIG="$CONFIG_DIR/config"
   JOBS_DIR="$CONFIG_DIR/config.d"
+  # The installed program's data, e.g. ~/.local/share/resticagent next to ~/.local/bin
+  SHARE_DIR="${BIN_PATH%/bin/resticagent}/share/resticagent"
 }
 
 if (( EUID == 0 )); then set_scope system; else set_scope user; fi
@@ -1173,11 +1179,30 @@ DROPIN
 }
 
 install_program() {
+  local src unit
   if [[ "$SELF" == "$(readlink -f "$BIN_PATH" 2>/dev/null || true)" ]]; then
     info "  running    $BIN_PATH (the installed copy)"
     return 0
   fi
   write_file "$BIN_PATH" 0755 <"$SELF"
+  # The unit templates go along, so the installed copy can install units too.
+  src=$(template_dir) || return 0
+  for unit in "${UNIT_PREFIX}.service" "${UNIT_PREFIX}.timer"; do
+    write_file "$SHARE_DIR/systemd/$unit" 0644 <"$src/$unit"
+  done
+}
+
+# template_dir -> the directory with the unit templates that came with this
+# program: ../systemd in a checkout, ../share/resticagent/systemd when installed
+template_dir() {
+  local dir
+  for dir in "${SELF%/*}/../systemd" "${SELF%/*}/../share/resticagent/systemd"; do
+    if [[ -f "$dir/${UNIT_PREFIX}.service" && -f "$dir/${UNIT_PREFIX}.timer" ]]; then
+      readlink -f "$dir"
+      return 0
+    fi
+  done
+  return 1
 }
 
 # render_template FILE -> a unit template with the paths of this scope. User
@@ -1196,15 +1221,14 @@ render_template() {
 
 install_templates() {
   local src_dir unit
-  src_dir=$(readlink -f "$(dirname "$SELF")/../systemd" 2>/dev/null || true)
-  if [[ -n "$src_dir" && -f "$src_dir/${UNIT_PREFIX}.service" && -f "$src_dir/${UNIT_PREFIX}.timer" ]]; then
+  if src_dir=$(template_dir); then
     for unit in "${UNIT_PREFIX}.service" "${UNIT_PREFIX}.timer"; do
       write_file "$SYSTEMD_DIR/$unit" 0644 < <(render_template "$src_dir/$unit")
     done
   elif [[ -f "$SYSTEMD_DIR/${UNIT_PREFIX}.service" && -f "$SYSTEMD_DIR/${UNIT_PREFIX}.timer" ]]; then
     note "  unit templates are not next to $SELF, keeping the installed ones"
   else
-    die "unit templates not found. Run install from the repository checkout: ${SUDO}./bin/resticagent install"
+    die "unit templates not found. Install resticagent with ./setup.sh, or run install from the repository checkout: ${SUDO}./bin/resticagent install"
   fi
 }
 
@@ -2221,7 +2245,7 @@ cmd_remove() {
     if (( ! keep_config )) && [[ -d "$JOBS_DIR/$job" ]]; then info "  - delete $JOBS_DIR/$job"; fi
   done
   if (( all )); then
-    info "  - delete the unit templates in $SYSTEMD_DIR and $BIN_PATH"
+    info "  - delete the unit templates in $SYSTEMD_DIR and $SHARE_DIR, and $BIN_PATH"
     if (( purge )); then
       info "  - delete $CONFIG_DIR, including the global settings and any password file in it"
     elif (( keep_config )); then
@@ -2267,6 +2291,10 @@ cmd_remove() {
     for file in "$SYSTEMD_DIR/${UNIT_PREFIX}.service" "$SYSTEMD_DIR/${UNIT_PREFIX}.timer"; do
       if [[ -e "$file" ]]; then rm -f -- "$file"; ok "deleted    $file"; ANY_CHANGED=1; fi
     done
+    for file in "$SHARE_DIR/systemd/${UNIT_PREFIX}.service" "$SHARE_DIR/systemd/${UNIT_PREFIX}.timer"; do
+      if [[ -e "$file" ]]; then rm -f -- "$file"; ok "deleted    $file"; fi
+    done
+    rmdir "$SHARE_DIR/systemd" "$SHARE_DIR" 2>/dev/null || true
     if [[ -e "$BIN_PATH" ]]; then rm -f -- "$BIN_PATH"; ok "deleted    $BIN_PATH"; fi
     if (( purge )) && [[ -d "$CONFIG_DIR" ]]; then
       rm -rf -- "${CONFIG_DIR:?}"
@@ -2280,6 +2308,9 @@ cmd_remove() {
     ok "reloaded   systemd units"
   fi
   ok "removed ${#jobs[@]} job(s)"
+  if (( all )) && [[ -f "$SHARE_DIR/manifest" ]]; then
+    note "What setup.sh installed besides the program stays. Remove it with: ./setup.sh --uninstall"
+  fi
   if (( ${#jobs[@]} > 0 )); then
     note "To delete a job's snapshots as well, run restic forget --tag job:<job> --prune against its repository."
   fi

@@ -22,14 +22,15 @@ resticagent status             # what ran, how it went, what runs next
 - **Run on demand.** `start` runs a job through systemd right now and streams its log, without ever overlapping a scheduled run.
 - **Snapshots per job.** `snapshots` lists a job's snapshots, and `show` shows what is in one with `ls -alh` or `tree`. `forget` deletes its oldest ones, or all but its newest, and lists exactly which ones go before asking.
 - **Clean removal.** `remove` deactivates and deletes jobs. It never touches the snapshots in a repository.
+- **One-step install, no root.** `setup.sh` installs it into `~/.local`, together with restic and tree if this machine lacks them, and removes it all again with `--uninstall`.
 - **No extra dependencies.** It needs bash, systemd and restic. Only `show` needs more: FUSE for its `ls` listing, and `tree` for `--tree`.
 
 ## Requirements
 
 - Linux with systemd, including `systemctl`, `journalctl` and `systemd-analyze`
 - Bash 4.4 or newer
-- restic 0.17 or newer
-- For `show` only: FUSE (the `fuse3` package) to list a snapshot with `ls`, and the `tree` command for `show --tree`
+- restic 0.17 or newer. `setup.sh` installs the latest release into `~/.local/bin` if needed.
+- For `show` only: FUSE (the `fuse3` package) to list a snapshot with `ls`, and the `tree` command for `show --tree`. `setup.sh` builds tree if it is missing and a C compiler is available. FUSE needs root to install.
 - Standard coreutils, diffutils and sed, which every mainstream distribution ships
 - Root access only for system-wide backups, see [Your backups or the system's](#your-backups-or-the-systems)
 
@@ -37,39 +38,60 @@ It was developed on Ubuntu 26.04 with systemd 259 and restic 0.18.1. Older syste
 
 ## Quick start
 
-1. Install restic from your distribution, for example `sudo apt install restic`, `sudo dnf install restic` or `sudo pacman -S restic`. If that version is older than 0.17, download a current release from [GitHub](https://github.com/restic/restic/releases).
-
-2. Get resticagent:
+1. Get resticagent and install it into `~/.local`. This needs no root. It also installs restic if this machine lacks it or has a version older than 0.17. See [Installing with setup.sh](#installing-with-setupsh).
 
    ```sh
    git clone https://github.com/chaudhryjunaid/restic-agent.git
    cd restic-agent
+   ./setup.sh
    ```
 
-3. Create a backup job. The first time, this also asks for the global settings, such as the repository and its password:
+2. Create a backup job. The first time, this also asks for the global settings, such as the repository and its password:
 
    ```sh
-   ./bin/resticagent add home
+   resticagent add home
    ```
 
    If you keep the settings in a file, import it instead. See [USAGE.md](USAGE.md#resticagent-import-file-job---global--y) for the format.
 
    ```sh
-   ./bin/resticagent import home.env
+   resticagent import home.env
    ```
 
-4. Install and activate it. This copies `resticagent` to `~/.local/bin`, checks the repository, offers to initialize it if it doesn't exist yet, and enables the job's timer:
+3. Activate it. This checks the repository, offers to initialize it if it doesn't exist yet, and enables the job's timer:
 
    ```sh
-   ./bin/resticagent install
+   resticagent install
    ```
 
-5. Run the first backup now and check on it:
+4. Run the first backup now and check on it:
 
    ```sh
    resticagent start home
    resticagent status
    ```
+
+## Installing with setup.sh
+
+`./setup.sh` installs resticagent for your own user, the way `make install PREFIX=~/.local` would:
+
+```text
+~/.local/bin/resticagent                  the program
+~/.local/share/resticagent/systemd/       its systemd unit templates
+~/.local/share/resticagent/manifest       every file setup.sh installed
+~/.local/share/doc/resticagent/           README.md, USAGE.md, LICENSE
+~/.local/bin/restic                       only if restic is missing or older than 0.17
+~/.local/bin/tree                         only if tree is missing, with its man page
+```
+
+- **restic** comes from its official GitHub release. setup.sh checks the release's SHA-256 sums, and their GPG signature against the key restic publishes (fingerprint `CF8F 18F2 8445 7597 3F79 D4E1 91A6 868B D3F7 A907`). Without `gpg` on the machine, only the sums are checked. It installs the latest release, or the one in `RESTIC_VERSION`, as in `RESTIC_VERSION=0.18.1 ./setup.sh`.
+- **tree** is built from source, so that needs a C compiler and `make`. Without them, setup.sh prints the command that installs tree from your distribution. Only `show --tree` needs it.
+- **FUSE** is only checked. `fusermount3` must be owned by root, so it cannot go into `~/.local`. setup.sh prints the command that installs it, such as `sudo apt install fuse3`. Only `show` needs it, to list snapshots with `ls`.
+- **The restic next to resticagent comes first.** resticagent runs a restic in its own directory before any on your PATH, so scheduled runs find it too. systemd's PATH does not include `~/.local/bin`.
+- **Running it again updates everything,** including the restic that setup.sh installed, to the latest release. A restic or tree that came from elsewhere is never touched.
+- **`./setup.sh --uninstall`** deletes the files in the manifest. Run `resticagent remove --all` first, which stops and removes your jobs. Your settings and snapshots stay.
+
+setup.sh installs for your own user only. For system-wide jobs, install the program with `sudo ./bin/resticagent install`.
 
 ## Your backups or the system's
 
@@ -131,6 +153,7 @@ Configuration lives on each host, here for your own jobs. System-wide jobs use t
 
 ```text
 ~/.local/bin/resticagent
+~/.local/share/resticagent/systemd/         the unit templates, for the installed program
 ~/.config/systemd/user/
 ├── restic-backup@.service                  template service, runs "resticagent run <job>"
 ├── restic-backup@.timer                    template timer
@@ -152,15 +175,17 @@ When a job's timer fires, systemd starts `restic-backup@home.service`. That runs
 ```sh
 cd restic-agent
 git pull
-./bin/resticagent install         # your own jobs
+./setup.sh                        # the program, and restic if setup.sh installed it
+resticagent install               # your own jobs' units
 sudo ./bin/resticagent install    # system-wide jobs, if you have any
 ```
 
-`install` replaces the program and the unit templates only if they changed, and leaves your configuration alone.
+`setup.sh` and `install` replace files only if they changed, and leave your configuration alone.
 
 ## Development
 
-- Lint with [shellcheck](https://www.shellcheck.net): `shellcheck bin/resticagent`.
+- Lint with [shellcheck](https://www.shellcheck.net): `shellcheck -x setup.sh bin/resticagent`.
+- `setup.sh` sources `bin/resticagent` for its paths and helpers. With `RESTICAGENT_ROOT` set, it installs below that directory too.
 - Set `RESTICAGENT_ROOT` to a scratch directory to try commands without changing the host. Every path is placed below that directory, and `--system` then works without root too. For system units, `enable` and `disable` act on the files there; `systemctl` can't do this for user units. Other systemctl calls that change state are only printed, and read-only queries still go to the host.
 - The script only runs its `main` function when executed, so a test can `source` it to call individual functions.
 

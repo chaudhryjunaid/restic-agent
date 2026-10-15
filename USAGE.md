@@ -144,7 +144,7 @@ Keep the file private, for example with `chmod 600 home.env`, because it can hol
 Installs and activates jobs. Without job names it installs every configured job. It is safe to run any number of times.
 
 1. It checks that systemd is running and, for your own jobs, that your systemd user manager can be reached. It also checks that restic 0.17 or newer is installed, and that the global settings exist.
-2. It copies itself to `~/.local/bin/resticagent` and the unit templates from the `systemd/` folder to `~/.config/systemd/user/`. The templates get your own program and settings paths. User units leave out `PrivateTmp=`, which needs user namespaces there.
+2. It copies itself to `~/.local/bin/resticagent`, with the unit templates from the `systemd/` folder in `~/.local/share/resticagent/systemd/`, so the installed copy can install units too. It puts the templates in `~/.config/systemd/user/`. The templates get your own program and settings paths. User units leave out `PrivateTmp=`, which needs user namespaces there.
 3. It validates each job: source paths, repository, password file, schedule, random delay and retention rules.
 4. It opens each job's repository, unless `--skip-repo-check` is given. Jobs that share a repository and password are checked once.
 5. It writes each job's schedule to `restic-backup@<job>.timer.d/schedule.conf`.
@@ -370,7 +370,7 @@ To delete a whole repository, delete its storage, such as the directory or the b
 | --- | --- |
 | `remove home` | Stops and disables the job's timer, and deletes its schedule file and its configuration. |
 | `remove home --keep-config` | Deactivates the job but keeps its configuration, so `install` can bring it back. |
-| `remove --all` | Removes every job, the unit templates and `~/.local/bin/resticagent`. The global settings and the password file stay. |
+| `remove --all` | Removes every job, the unit templates and `~/.local/bin/resticagent`. The global settings and the password file stay. If you installed with `setup.sh`, run `./setup.sh --uninstall` afterwards to remove the rest. |
 | `remove --all --keep-config` | Uninstalls everything but keeps all configuration in `~/.config/resticagent`. |
 | `remove --all --purge` | Uninstalls everything and deletes `~/.config/resticagent`, including a password file stored there. |
 
