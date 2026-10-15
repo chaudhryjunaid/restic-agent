@@ -32,7 +32,7 @@
 
 set -euo pipefail
 
-VERSION="0.6.0"
+VERSION="0.7.0"
 ROOT="${RESTICAGENT_ROOT:-}"
 ROOT=${ROOT%/}
 UNIT_PREFIX="restic-backup@"
@@ -1495,6 +1495,124 @@ cmd_run() {
 }
 
 # ---------------------------------------------------------------------------
+# forget: delete chosen snapshots of one job, after listing them
+# ---------------------------------------------------------------------------
+
+# json_ids -> the full snapshot IDs in the restic JSON on stdin, in order.
+# Quotes inside JSON strings are escaped, so "id":" only matches the key.
+json_ids() { { grep -o '"id":"[0-9a-f]\{64\}"' || true; } | cut -d'"' -f4; }
+
+# forget_plan_ids keep|remove -> the IDs that restic forget --json on stdin
+# keeps or removes. Each group's lists are split onto lines of their own.
+forget_plan_ids() {
+  sed -E 's/"(keep|remove|reasons)":/\n&/g' | { grep "^\"$1\":" || true; } | json_ids
+}
+
+cmd_forget() {
+  local job='' arg keep_last='' older_than='' oldest='' dry_run=0 yes=0 prune='' prune_hint='' repo json id rc=0
+  local -a orig=("$@") rules=() listed=() ids=() kept=() forget=()
+  local -A is_kept=()
+  while (( $# > 0 )); do
+    arg=$1
+    shift
+    # --keep-last=5 works as well as --keep-last 5.
+    if [[ "$arg" == --*=* ]]; then set -- "${arg#*=}" "$@"; arg=${arg%%=*}; fi
+    case $arg in
+      --keep-last|--oldest)
+        [[ "${1:-}" =~ ^[1-9][0-9]*$ ]] || die "$arg needs a whole number of 1 or more"
+        if [[ "$arg" == --keep-last ]]; then keep_last=$1; else oldest=$1; fi
+        shift ;;
+      --older-than)
+        [[ "${1:-}" =~ ^([0-9]+[ymdh])+$ ]] || die "--older-than needs a restic duration such as 30d, 2m or 1y6m"
+        older_than=$1
+        shift ;;
+      --dry-run)  dry_run=1 ;;
+      --prune)    prune=1 ;;
+      --no-prune) prune=0 ;;
+      -y|--yes)   yes=1 ;;
+      -*)         die "unknown option '$arg' (see '$PROG help')" ;;
+      *)          [[ -z "$job" ]] || die "forget takes a single job"; job=$arg ;;
+    esac
+  done
+  [[ -n "$job" ]] || die "usage: $PROG forget JOB --keep-last N | --older-than DURATION | --oldest N  (see '$PROG help')"
+  validate_job_name "$job" || die "invalid job name '$job'"
+  [[ -n "$keep_last$older_than$oldest" ]] || die "choose what to forget with --keep-last N, --older-than DURATION or --oldest N"
+  if [[ -n "$oldest" && -n "$keep_last$older_than" ]]; then die "--oldest cannot be combined with --keep-last or --older-than"; fi
+  require_root forget "${orig[@]}"
+  [[ -f "$JOBS_DIR/$job/env" ]] || die "job '$job' is not configured. Run: $SUDO$PROG add $job"
+  require_restic
+  load_job_env "$job"
+  export_job_env
+  repo=${JENV[RESTIC_REPOSITORY]:-?}
+  if [[ -z "$prune" ]]; then
+    if [[ "${JENV[PRUNE]:-0}" == 1 ]]; then prune=1; else prune=0; fi
+    prune_hint=' Add --prune to prune now.'
+  fi
+
+  # Pick the exact snapshots up front, and later forget them by ID, so what is
+  # forgotten is what was listed even if a backup finishes in between. Reading
+  # takes no lock, so a running backup does not hold up the list.
+  if [[ -n "$oldest" ]]; then
+    json=$(restic snapshots --no-lock --json --tag "job:$job") \
+      || die "could not read the snapshots of job '$job' in $repo"
+    # Without --group-by, restic lists the snapshots oldest first.
+    mapfile -t listed < <(json_ids <<<"$json")
+    ids=("${listed[@]:0:oldest}")
+    kept=("${listed[@]:oldest}")
+  else
+    # The same selection and grouping as the job's retention in run.
+    [[ -n "$keep_last" ]] && rules+=(--keep-last "$keep_last")
+    [[ -n "$older_than" ]] && rules+=(--keep-within "$older_than")
+    json=$(restic forget --no-lock --dry-run --json --tag "job:$job" --group-by host "${rules[@]}") \
+      || die "could not work out which snapshots of job '$job' to forget in $repo"
+    mapfile -t ids < <(forget_plan_ids remove <<<"$json")
+    mapfile -t kept < <(forget_plan_ids keep <<<"$json")
+    for id in "${kept[@]}"; do is_kept[$id]=1; done
+    for id in "${ids[@]}"; do
+      [[ -z "${is_kept[$id]:-}" ]] || die "could not read the plan of restic forget, so nothing was forgotten"
+    done
+  fi
+
+  if (( ${#ids[@]} + ${#kept[@]} == 0 )); then
+    info "Job '$job' has no snapshots in $repo."
+    return 0
+  fi
+  if (( ${#ids[@]} == 0 )); then
+    ok "nothing to forget: all ${#kept[@]} snapshots of job '$job' are kept"
+    return 0
+  fi
+
+  header "Snapshots of job '$job' to forget"
+  restic snapshots --no-lock --compact "${ids[@]}" || die "could not list the snapshots to forget"
+  header "This will"
+  info "  - forget ${#ids[@]} of the $(( ${#ids[@]} + ${#kept[@]} )) snapshots of job '$job' in $repo"
+  if (( prune )); then
+    info "  - prune the repository, to free the data no other snapshot uses"
+  else
+    info "  - leave their data in the repository until it is pruned.$prune_hint"
+  fi
+  note "Snapshots of other jobs are not touched."
+  if (( ${#kept[@]} == 0 )); then warn "this forgets every snapshot of job '$job'"; fi
+  if (( dry_run )); then
+    note "Dry run: nothing was forgotten."
+    return 0
+  fi
+  if (( ! yes )); then
+    ask_yesno "Proceed?" n || die "nothing forgotten"
+  fi
+
+  header "Forgetting"
+  forget=(forget --retry-lock 30m)
+  if (( prune )); then forget+=(--prune); fi
+  restic "${forget[@]}" "${ids[@]}" || rc=$?
+  if (( rc != 0 )); then
+    printf '%serror:%s forget failed (restic exit %d)\n' "$C_RED" "$C_RESET" "$rc" >&2
+    return "$rc"
+  fi
+  ok "forgot ${#ids[@]} snapshot(s) of job '$job'"
+}
+
+# ---------------------------------------------------------------------------
 # Shared output helpers for list and status
 # ---------------------------------------------------------------------------
 
@@ -1962,12 +2080,24 @@ Running a job now:
   run JOB             Run JOB directly in this terminal, outside systemd. The
                       systemd service uses this command itself.
 
+Snapshots:
+  forget JOB --keep-last N | --older-than DURATION | --oldest N
+             [--dry-run] [--prune | --no-prune] [-y]
+                      List the snapshots of JOB to forget, ask, then forget
+                      them. --keep-last N keeps the N newest. --older-than
+                      DURATION (30d, 1y6m) forgets those more than DURATION
+                      older than the newest. Together, a snapshot stays if
+                      either keeps it. --oldest N forgets the N oldest. Their
+                      data is pruned if the job's PRUNE setting is on.
+                      --dry-run only lists them.
+
 Other:
   help                Show this help
   version             Show the version
 
-Every command is safe to re-run. Files are rewritten only when their content
-changes, and systemd is reloaded only when a unit file changed.
+Every command is safe to re-run, except that each forget --oldest N forgets N
+more. Files are rewritten only when their content changes, and systemd is
+reloaded only when a unit file changed.
 USAGE
 }
 
@@ -1992,6 +2122,7 @@ main() {
     logs|log)          cmd_logs "$@" ;;
     start)             cmd_start "$@" ;;
     run)               cmd_run "$@" ;;
+    forget)            cmd_forget "$@" ;;
     help|-h|--help)    usage ;;
     version|--version) echo "$PROG $VERSION" ;;
     *)                 die "unknown command '$cmd' (see '$PROG help')" ;;

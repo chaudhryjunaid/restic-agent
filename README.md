@@ -20,6 +20,7 @@ resticagent status             # what ran, how it went, what runs next
 - **Retention that stays in its lane.** Every snapshot is tagged `job:<name>`, so old snapshots are forgotten per job, even when several jobs share a repository.
 - **Monitoring built in.** `status` shows the last result and next run of every job and exits non-zero after a failure. `logs` opens the journal of a job or of its latest run.
 - **Run on demand.** `start` runs a job through systemd right now and streams its log, without ever overlapping a scheduled run.
+- **Forget on request.** `forget` deletes a job's oldest snapshots, or all but its newest, and lists exactly which ones go before asking.
 - **Clean removal.** `remove` deactivates and deletes jobs. It never touches the snapshots in a repository.
 - **No extra dependencies.** It needs bash, systemd and restic, nothing else.
 
@@ -103,6 +104,7 @@ Things to know about your own jobs:
 | `run JOB` | Run a job directly in the terminal, outside systemd |
 | `status [JOB]` | Show timer state, last run, result and next run |
 | `logs [JOB]` | Show the journal of all jobs or one job |
+| `forget JOB` | Forget a job's snapshots by count or age, after listing them |
 | `remove JOB...` | Deactivate and delete jobs, or everything with `--all` |
 
 None of them need root for your own jobs. For system-wide jobs, every command needs `sudo` except `status` and `logs`, which also work with `--system`. `ls`, `rm` and `log` work as short forms of `list`, `remove` and `logs`. See [USAGE.md](USAGE.md) for every option, the configuration file format, restoring files and troubleshooting.
@@ -138,7 +140,7 @@ When a job's timer fires, systemd starts `restic-backup@home.service`. That runs
 ## Safety notes
 
 - **Keep a copy of the repository password somewhere else.** Without it, the backups cannot be restored.
-- **`remove` never deletes snapshots,** even with `--purge`. Retention only forgets snapshots tagged with the job's own `job:<name>` tag.
+- **`remove` never deletes snapshots,** even with `--purge`. Retention and `forget` only forget snapshots tagged with the job's own `job:<name>` tag.
 - **The global settings and each job's `env` file are readable only by their owner,** you or root, because they can hold backend credentials.
 - **Values cannot contain single quotes or backslashes.** This keeps the files valid for both Bash and systemd, and the prompts refuse those characters.
 

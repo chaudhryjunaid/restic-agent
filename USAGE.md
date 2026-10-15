@@ -7,6 +7,7 @@ This guide covers every command, the configuration files, restoring data and tro
 - [Running backups](#running-backups): schedules, `start`, `run`
 - [Monitoring](#monitoring): `status`, `logs`, `list`
 - [Changing a job](#changing-a-job)
+- [Forgetting snapshots](#forgetting-snapshots): `forget`
 - [Removing jobs](#removing-jobs): `remove`
 - [Restoring files](#restoring-files)
 - [File reference](#file-reference)
@@ -19,7 +20,7 @@ This guide covers every command, the configuration files, restoring data and tro
 - **Global settings** are shared by every job: the default repository, the password file, the cache directory, compression, and any backend credentials. They live in `~/.config/resticagent/config`.
 - **A job** is one set of paths backed up on one schedule with one retention policy. Its name may contain letters, digits, `-` and `_`. Each job has a directory `~/.config/resticagent/config.d/<job>/`.
 - **The repository** is where restic stores snapshots. Jobs use the global repository unless they override it, and several jobs can share one repository.
-- **The job tag.** Every snapshot a job creates carries the tag `job:<job>`. Retention only ever considers snapshots with that tag.
+- **The job tag.** Every snapshot a job creates carries the tag `job:<job>`. Retention and `forget` only ever consider snapshots with that tag.
 - **The timer** `restic-backup@<job>.timer` starts the service `restic-backup@<job>.service` on the job's schedule.
 
 ## Setting up
@@ -294,6 +295,28 @@ Retention uses short forms: `7d 4w 6m 1y` means 7 daily, 4 weekly, 6 monthly and
 
 Snapshots made by the system-wide job stay in the repository. They carry the same `job:<job>` tag, so retention keeps treating them as part of the job.
 
+## Forgetting snapshots
+
+Retention runs after every backup. To forget snapshots now, without a backup or a change to the job's rules, use `forget`:
+
+| Command | Forgets |
+| --- | --- |
+| `forget home --keep-last 5` | all but the 5 newest snapshots of each host |
+| `forget home --older-than 30d` | the snapshots more than 30 days older than the newest one of their host |
+| `forget home --keep-last 5 --older-than 30d` | only the snapshots that neither rule keeps |
+| `forget home --oldest 3` | the 3 oldest snapshots of the job, whichever host made them |
+
+- **It shows what will go.** `forget` lists the snapshots it picked and asks before forgetting them. `--dry-run` stops after the list, and `-y` skips the question in scripts.
+- **Exactly the listed snapshots are forgotten.** They are forgotten by ID, so a backup that finishes while you answer does not change the selection.
+- **`--keep-last` and `--older-than` work like the job's retention.** They are restic's `--keep-last` and `--keep-within`, applied per host. `--older-than` counts back from the newest snapshot, not from today, so a job whose backups stopped never loses all of its snapshots this way. Durations use restic's units: `y`, `m`, `d` and `h`, as in `1y6m`.
+- **`--oldest N` forgets N more each time it runs.** A number at least as large as the job's snapshot count forgets all of them, and `forget` warns before it does.
+- **Pruning follows the job's `PRUNE` setting.** Pruning deletes the data no remaining snapshot uses, which is what frees space. `--prune` or `--no-prune` overrides the setting for one run.
+- **Snapshots of other jobs are never touched,** even when they share the repository.
+
+`forget` waits up to 30 minutes for a running backup to release the repository lock.
+
+To delete a whole repository, delete its storage, such as the directory or the bucket, with the tools of its backend. restic has no command for it. Run `remove` for every job that uses it first, since `install` offers to create a new, empty repository where one is missing.
+
 ## Removing jobs
 
 | Command | Effect |
@@ -308,7 +331,7 @@ These only touch one set of jobs: your own, or the system-wide ones with `sudo`.
 
 `remove` lists what it will delete and asks before doing anything. Add `-y` to skip the question in scripts.
 
-A backup that is running when you remove its job is allowed to finish. Snapshots in the repository are never deleted. To delete a removed job's snapshots too, run `restic forget --tag job:<job> --prune` against its repository, as shown in the next section.
+A backup that is running when you remove its job is allowed to finish. Snapshots in the repository are never deleted. To delete a job's snapshots too, run `forget` before `remove`, since `forget` needs the job's settings. For a job that is already removed, run `restic forget --tag job:<job> --prune` against its repository, with its settings loaded as shown in the next section.
 
 ## Restoring files
 
@@ -394,6 +417,8 @@ One restic exclude pattern per line, passed to `restic backup --exclude-file`. L
 | 130 | `start` stopped following after Ctrl-C. The backup itself keeps running. |
 
 If the backup fails, retention is skipped. If the backup succeeds but `restic forget` fails, `run` returns the code from `forget`.
+
+`forget` returns the exit code of `restic forget` when that fails, for example 11 when the lock could not be taken.
 
 `status` returns 1 when any job's last run failed or was partial, and 0 otherwise. `logs` returns the exit code of `journalctl`. The other commands return 0 on success and 1 on an error.
 
