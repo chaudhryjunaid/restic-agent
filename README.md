@@ -20,7 +20,7 @@ resticagent status             # what ran, how it went, what runs next
 - **Retention that stays in its lane.** Every snapshot is tagged `job:<name>`, so old snapshots are forgotten per job, even when several jobs share a repository.
 - **Monitoring built in.** `status` shows the last result and next run of every job and exits non-zero after a failure. `logs` opens the journal of a job or of its latest run.
 - **Run on demand.** `start` runs a job through systemd right now and streams its log, without ever overlapping a scheduled run.
-- **Forget on request.** `forget` deletes a job's oldest snapshots, or all but its newest, and lists exactly which ones go before asking.
+- **Snapshots per job.** `snapshots` lists a job's snapshots. `forget` deletes its oldest ones, or all but its newest, and lists exactly which ones go before asking.
 - **Clean removal.** `remove` deactivates and deletes jobs. It never touches the snapshots in a repository.
 - **No extra dependencies.** It needs bash, systemd and restic, nothing else.
 
@@ -104,6 +104,7 @@ Things to know about your own jobs:
 | `run JOB` | Run a job directly in the terminal, outside systemd |
 | `status [JOB]` | Show timer state, last run, result and next run |
 | `logs [JOB]` | Show the journal of all jobs or one job |
+| `snapshots JOB` | List a job's snapshots |
 | `forget JOB` | Forget a job's snapshots by count or age, after listing them |
 | `remove JOB...` | Deactivate and delete jobs, or everything with `--all` |
 

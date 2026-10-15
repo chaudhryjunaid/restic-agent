@@ -1495,6 +1495,44 @@ cmd_run() {
 }
 
 # ---------------------------------------------------------------------------
+# snapshots: the snapshots one job has made
+# ---------------------------------------------------------------------------
+cmd_snapshots() {
+  local job=${1:-} arg out rc=0 json=0
+  [[ -n "$job" && "$job" != -* ]] || die "usage: $PROG snapshots JOB [restic snapshots options]  (see '$PROG help')"
+  shift
+  validate_job_name "$job" || die "invalid job name '$job'"
+  for arg in "$@"; do
+    case $arg in
+      # restic ORs repeated --tag filters, which would let in other jobs.
+      --tag|--tag=*) die "snapshots only shows the snapshots tagged job:$job, so --tag cannot be used" ;;
+      --json)        json=1 ;;
+    esac
+  done
+  require_root snapshots "$job" "$@"
+  [[ -f "$JOBS_DIR/$job/env" ]] || die "job '$job' is not configured. Run: $SUDO$PROG add $job"
+  require_restic
+  load_job_env "$job"
+  export_job_env
+
+  if (( ! json )); then header "Snapshots of job '$job' in ${JENV[RESTIC_REPOSITORY]:-?}"; fi
+  # Reading takes no lock, so a running backup or prune does not block it.
+  out=$(restic snapshots --no-lock --tag "job:$job" "$@") || rc=$?
+  if (( rc != 0 )); then
+    printf "%serror:%s could not list the snapshots of job '%s' (restic exit %d)\n" "$C_RED" "$C_RESET" "$job" "$rc" >&2
+    return "$rc"
+  fi
+  # restic prints nothing at all when no snapshot matches.
+  if [[ -n "$out" ]]; then
+    printf '%s\n' "$out"
+  elif (( $# > 0 )); then
+    info "No snapshots of job '$job' match."
+  else
+    info "Job '$job' has no snapshots yet. Make one now with: $SUDO$PROG start $job"
+  fi
+}
+
+# ---------------------------------------------------------------------------
 # forget: delete chosen snapshots of one job, after listing them
 # ---------------------------------------------------------------------------
 
@@ -2081,6 +2119,9 @@ Running a job now:
                       systemd service uses this command itself.
 
 Snapshots:
+  snapshots JOB [restic snapshots options]
+                      List the snapshots of JOB, oldest first. Options go to
+                      restic snapshots, e.g. --compact, --latest 5 or --json.
   forget JOB --keep-last N | --older-than DURATION | --oldest N
              [--dry-run] [--prune | --no-prune] [-y]
                       List the snapshots of JOB to forget, ask, then forget
@@ -2122,6 +2163,7 @@ main() {
     logs|log)          cmd_logs "$@" ;;
     start)             cmd_start "$@" ;;
     run)               cmd_run "$@" ;;
+    snapshots)         cmd_snapshots "$@" ;;
     forget)            cmd_forget "$@" ;;
     help|-h|--help)    usage ;;
     version|--version) echo "$PROG $VERSION" ;;

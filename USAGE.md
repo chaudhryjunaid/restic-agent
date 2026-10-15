@@ -7,7 +7,7 @@ This guide covers every command, the configuration files, restoring data and tro
 - [Running backups](#running-backups): schedules, `start`, `run`
 - [Monitoring](#monitoring): `status`, `logs`, `list`
 - [Changing a job](#changing-a-job)
-- [Forgetting snapshots](#forgetting-snapshots): `forget`
+- [Snapshots](#snapshots): `snapshots`, `forget`
 - [Removing jobs](#removing-jobs): `remove`
 - [Restoring files](#restoring-files)
 - [File reference](#file-reference)
@@ -295,7 +295,26 @@ Retention uses short forms: `7d 4w 6m 1y` means 7 daily, 4 weekly, 6 monthly and
 
 Snapshots made by the system-wide job stay in the repository. They carry the same `job:<job>` tag, so retention keeps treating them as part of the job.
 
-## Forgetting snapshots
+## Snapshots
+
+### `resticagent snapshots JOB [restic options]`
+
+Lists the snapshots of a job, oldest first, from the job's repository.
+
+```sh
+resticagent snapshots home
+resticagent snapshots home --compact
+resticagent snapshots home --latest 3
+resticagent snapshots home --json
+```
+
+- **Only the job's own snapshots are shown,** the ones tagged `job:<job>`, even when other jobs share the repository. `--tag` is refused, because restic would add the snapshots with that tag to the list.
+- **Other options go to `restic snapshots` unchanged.** Useful ones are `--compact` to leave out the paths, `--latest N` for the newest N of each host and set of paths, `--host`, `--path`, `--group-by host` and `--json`.
+- **It takes no repository lock,** so it works while a backup or prune is running.
+
+The IDs in the list work with restic directly, for example to restore one snapshot. See [Restoring files](#restoring-files).
+
+### `resticagent forget JOB ...`
 
 Retention runs after every backup. To forget snapshots now, without a backup or a change to the job's rules, use `forget`:
 
@@ -349,7 +368,7 @@ restic restore latest --tag job:home --target /tmp/restore
 restic restore latest --tag job:home --target /tmp/restore --include /home/me/Documents
 ```
 
-`set -a` exports every variable the files define, so restic finds the repository, the password file and any credentials. Restore into a separate directory first, then copy back what you need. For a system-wide job, start with `sudo -i` and load the files in `/etc/resticagent` instead.
+`resticagent snapshots home` shows the same list as the `restic snapshots` line, without loading anything. `set -a` exports every variable the files define, so restic finds the repository, the password file and any credentials. Restore into a separate directory first, then copy back what you need. For a system-wide job, start with `sudo -i` and load the files in `/etc/resticagent` instead.
 
 To browse snapshots like a folder, use `restic mount /mnt/restic`. This needs FUSE.
 
